@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""hstrack - tiny Hearthstone tracker. Follows Power.log, stdlib only."""
+import argparse, glob, json, os, re, sys, time, urllib.request
+from collections import Counter
+
+CARDS_URL = "https://api.hearthstonejson.com/v1/latest/enUS/cards.json"
+CACHE = os.path.expanduser("~/.cache/hstrack/names.json")
+LOG_CONFIG = """[Power]
+LogLevel=1
+FilePrinting=true
+ConsolePrinting=false
+ScreenPrinting=false
+Verbose=true
+"""
+
+PWR = re.compile(r"GameState\.DebugPrintPower\(\) - (.*)$")
+BRACKET = re.compile(r"\[entityName=(.*?) id=(\d+) zone=(\w+) zonePos=\d+ cardId=(\w*) player=(\d+)\]")
+FULL = re.compile(r"FULL_ENTITY - Creating ID=(\d+) CardID=(\w*)")
+SHOW = re.compile(r"(?:SHOW|CHANGE)_ENTITY - Updating Entity=(.+) CardID=(\w*)$")
+CHANGE = re.compile(r"(?:TAG_CHANGE|HIDE_ENTITY -) Entity=(.+) tag=(\w+) value=(\w+)$")
+TAG = re.compile(r"tag=(\w+) value=(\w+)$")
+
+
+class Game:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.ents, self.me, self.turn, self.cur = {}, None, 0, None
+
+    def ent(self, eid):
+        return self.ents.setdefault(eid, dict(card="", name="", zone=None, ctrl=None,
+                                              left_deck=False, played=False))
+
+    def ref(self, text):
+        m = BRACKET.search(text)
+        if m:
+            e = self.ent(int(m[2]))
+            if e["zone"] is None: e["zone"] = m[3]
+            if e["ctrl"] is None: e["ctrl"] = int(m[5])
+            if m[4] and not e["card"]: e["card"] = m[4]
+            if not m[1].startswith("UNKNOWN"): e["name"] = m[1]
+            return e
+        return self.ent(int(text)) if text.isdigit() else None
+
+    def tag(self, e, tag, val):
+        if tag == "CONTROLLER" and val.isdigit():
+            e["ctrl"] = int(val)
+        elif tag == "ZONE":
+            old, e["zone"] = e["zone"], val
+            if val == "DECK": e["left_deck"] = False
+            elif old == "DECK": e["left_deck"] = True
+            if old in ("HAND", "DECK") and val in ("PLAY", "SECRET", "GRAVEYARD"):
+                e["played"] = True
+
+    def feed(self, line):
+        """Process one log line; True if the tracked state may have changed."""
+        if "GameState.DebugPrintPower" not in line: return False
+        m = PWR.search(line)
+        if not m: return False
+        s = m[1].strip()
+        if s == "CREATE_GAME":
+            self.reset(); return True
+        if s.startswith(("GameEntity", "Player ")):
+            self.cur = None; return False
+        if (m := FULL.match(s)):
+            e = self.ent(int(m[1])); e["card"] = m[2]; self.cur = e
+            return True
+        if (m := SHOW.match(s)):
+            e = self.ref(m[1]); self.cur = e
+            if e is None: return False
+            if m[2]:
+                # first reveal of a deck card = our own draw -> that controller is us
+                if self.me is None and e["zone"] == "DECK" and not e["card"] and e["ctrl"]:
+                    self.me = e["ctrl"]
+                if m[2] != e["card"]: e["card"], e["name"] = m[2], ""
+            return True
+        if (m := CHANGE.match(s)):
+            self.cur = None
+            if m[1] == "GameEntity":
+                if m[2] == "TURN": self.turn = int(m[3]); return True
+                return False
+            e = self.ref(m[1])
+            if e is None: return False
+            self.tag(e, m[2], m[3]); return True
+        if (m := TAG.match(s)) and self.cur is not None:
+            self.tag(self.cur, m[1], m[2]); return True
+        self.cur = None
+        return False
+
+
+def label(e, names):
+    return names.get(e["card"]) or e["name"] or e["card"] or "?"
+
+
+def render(g, names, deck):
+    me = g.me
+    mine = [e for e in g.ents.values() if me and e["ctrl"] == me]
+    opp = [e for e in g.ents.values() if me and e["ctrl"] == 3 - me]
+    count = lambda es, z: sum(e["zone"] == z for e in es)
+    out = [f"turn {g.turn}   you = player {me or '?'}",
+           f"you: deck {count(mine, 'DECK')} hand {count(mine, 'HAND')}"
+           f"    opp: deck {count(opp, 'DECK')} hand {count(opp, 'HAND')}", ""]
+    hand = sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"])
+    out.append("HAND: " + (", ".join(hand) or "-"))
+    drawn = [e for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]]
+    if deck:
+        left = {k: v[1] for k, v in deck.items()}
+        for e in drawn:
+            k = label(e, names).lower()
+            if k in left: left[k] -= 1
+        size = max(count(mine, "DECK"), 1)
+        out += ["", f"DECK ({count(mine, 'DECK')} cards left)"]
+        out += [f"  {c}x {deck[k][0]}  {100 * c // size}%" for k, c in sorted(left.items()) if c > 0]
+    else:
+        out += ["", f"DRAWN ({len(drawn)})"]
+        out += [f"  {c}x {n}" for n, c in sorted(Counter(label(e, names) for e in drawn).items())]
+    seen = Counter(label(e, names) for e in opp if e["played"] and e["card"])
+    out += ["", f"OPPONENT PLAYED ({sum(seen.values())})"]
+    out += [f"  {c}x {n}" for n, c in sorted(seen.items())]
+    if sys.stdout.isatty(): sys.stdout.write("\033[2J\033[H")
+    print("\n".join(out), flush=True)
+
+
+def load_names():
+    try:
+        with open(CACHE, encoding="utf-8") as f: return json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        req = urllib.request.Request(CARDS_URL, headers={"User-Agent": "hstrack"})
+        with urllib.request.urlopen(req, timeout=30) as r: cards = json.load(r)
+        names = {c["id"]: c["name"] for c in cards if "name" in c}
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w", encoding="utf-8") as f: json.dump(names, f)
+        return names
+    except Exception as ex:
+        print(f"no card-name database ({ex}); using names from the log", file=sys.stderr)
+        return {}
+
+
+def load_deck(path):
+    deck = {}
+    with open(path, encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"): continue
+            m = re.match(r"(\d+)\s*x?\s+(.+)$", ln)
+            n, name = (int(m[1]), m[2]) if m else (1, ln)
+            k = name.lower()
+            deck[k] = (name, deck.get(k, ("", 0))[1] + n)
+    return deck
+
+
+def find_log(prefix):
+    base = os.path.join(prefix, "drive_c/Program Files*/Hearthstone/Logs")
+    hits = glob.glob(base + "/*/Power.log") + glob.glob(base + "/Power.log")
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def setup(prefix):
+    blizz = glob.glob(os.path.join(prefix, "drive_c/users/*/AppData/Local/Blizzard"))
+    d = os.path.join(blizz[0] if blizz else os.path.join(
+        prefix, "drive_c/users", os.environ.get("USER", "user"), "AppData/Local/Blizzard"), "Hearthstone")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "log.config")
+    old = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+    if "[Power]" in old:
+        print(p, "already has a [Power] section"); return
+    with open(p, "a", encoding="utf-8") as f: f.write(("\n" if old else "") + LOG_CONFIG)
+    print("wrote", p, "- restart Hearthstone for it to take effect")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Tiny Hearthstone tracker (follows Power.log)")
+    ap.add_argument("--prefix", default=os.environ.get("HS_PREFIX", "~/Games/battlenet"),
+                    help="Wine prefix containing Hearthstone (default: $HS_PREFIX or ~/Games/battlenet)")
+    ap.add_argument("--log", help="read this Power.log instead of searching the prefix")
+    ap.add_argument("--deck", help="decklist file, one card per line, e.g. '2 Fireball'")
+    ap.add_argument("--once", action="store_true", help="parse once, print, exit")
+    ap.add_argument("--setup", action="store_true", help="make Hearthstone write Power.log, then exit")
+    a = ap.parse_args()
+    prefix = os.path.expanduser(a.prefix)
+    if a.setup: return setup(prefix)
+
+    names = load_names()
+    deck = load_deck(a.deck) if a.deck else {}
+    g, f, path, checked = Game(), None, "", 0.0
+    while True:
+        if a.log: want = a.log
+        elif time.time() - checked > 5: want, checked = find_log(prefix), time.time()
+        else: want = path
+        changed = False
+        if want != path:
+            if f: f.close()
+            path = want
+            try: f = open(path, encoding="utf-8", errors="replace") if path else None
+            except OSError as ex: sys.exit(f"cannot open {path}: {ex}")
+            g.reset()
+            changed = bool(path)
+            if not path:
+                print(f"no Power.log under {prefix} yet - run --setup once, start Hearthstone, "
+                      f"or pass --prefix / --log", file=sys.stderr)
+        while f:
+            pos = f.tell()
+            line = f.readline()
+            if not line.endswith("\n"):   # EOF or half-written line
+                f.seek(pos); break
+            changed |= g.feed(line)
+        if changed: render(g, names, deck)
+        if a.once: break
+        time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: pass
