@@ -1,9 +1,9 @@
 # hstrack
 
-Tiny Hearthstone tracker for Linux. Follows `Power.log` and prints a live
-terminal panel: turn, deck/hand sizes for both players, your hand, cards you
-drew (or cards left in your deck, with draw %), and cards the opponent played.
-Python 3, standard library only. No Wine needed for the tracker itself.
+Tiny Hearthstone tracker for Linux. It follows Hearthstone's `Power.log` and
+shows the **cards remaining in your deck** (mana cost, count, draw chance) in a
+small always-on-top overlay. Python 3, standard library only; the tracker
+itself needs no Wine. The overlay needs Tk (Void: `sudo xbps-install -S python3-tkinter`).
 
 ## Install
 
@@ -12,24 +12,35 @@ Python 3, standard library only. No Wine needed for the tracker itself.
 
 ## Use
 
-    # once: make Hearthstone write Power.log, then restart the game
+Once, so Hearthstone writes `Power.log` (then restart the game):
+
     hstrack --setup --prefix ~/Games/battlenet
 
-    # each session, in a terminal next to the game
-    hstrack --prefix ~/Games/battlenet [--deck deck.txt]
+Each session:
+
+    hstrack --overlay --prefix ~/Games/battlenet
+
+1. In Hearthstone, copy your deck (deck code goes to the clipboard).
+2. Click **paste** in the overlay header. The deck is remembered in
+   `~/.cache/hstrack/last_deck.txt`, so you only paste once per deck.
+
+You can also load a deck from a file or code: `--deck deck.txt` (lines like
+`2 Fireball`, matched by card name) or `--deck <deck code>`.
+
+Overlay options: `--pos +20+120` start position (drag the header to move),
+`--size 13` font size, `--alpha 0.9` opacity, `--opp` also list the cards the
+opponent played. Without `--overlay` you get a terminal view; `--once` parses
+once and exits; `--log /path/to/Power.log` reads a specific file.
 
 `--prefix` is the Wine prefix containing Hearthstone (or set `HS_PREFIX`).
-Use `--log /path/to/Power.log` to read a specific file, add `--once` to parse
-once and exit (handy for testing against saved logs).
-
-`deck.txt` is one card per line, e.g. `2 Fireball`, matched by card name.
-Power.log does not contain your decklist, so cards-left needs this file;
-without it the panel shows the cards you have drawn.
 
 ## Notes
 
-- Card names are downloaded once from HearthstoneJSON into
-  `~/.cache/hstrack/names.json` (delete it to refresh after an expansion).
-  If the download fails, names from the log are used.
-- Parser written against the Power.log format and tested on a synthetic log;
-  real-game edge cases may need fixes.
+- Run Hearthstone windowed or borderless windowed; exclusive fullscreen covers the overlay.
+- Transparency needs a compositor (xfwm4: Window Manager Tweaks > Compositor); otherwise it is opaque.
+- The overlay is not click-through; park it over empty screen space.
+- Power.log does not contain your decklist, hence the paste step.
+- Card names/costs come from HearthstoneJSON, downloaded once to
+  `~/.cache/hstrack/cards2.json` (delete it to refresh after an expansion).
+- Tested against a synthetic Power.log under a virtual X server. Not yet
+  verified with a real game under Wine (clipboard bridge, window stacking).

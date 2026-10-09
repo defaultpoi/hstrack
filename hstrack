@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""hstrack - tiny Hearthstone tracker. Follows Power.log, stdlib only."""
-import argparse, glob, json, os, re, sys, time, urllib.request
+"""hstrack - tiny Hearthstone tracker with a remaining-deck overlay. Follows Power.log, stdlib only."""
+import argparse, base64, glob, json, os, re, sys, time, urllib.request
 from collections import Counter
 
 CARDS_URL = "https://api.hearthstonejson.com/v1/latest/enUS/cards.json"
-CACHE = os.path.expanduser("~/.cache/hstrack/names.json")
+CACHE_DIR = os.path.expanduser("~/.cache/hstrack")
+DB_CACHE = os.path.join(CACHE_DIR, "cards2.json")
+DECK_CACHE = os.path.join(CACHE_DIR, "last_deck.txt")
 LOG_CONFIG = """[Power]
 LogLevel=1
 FilePrinting=true
@@ -21,6 +23,11 @@ CHANGE = re.compile(r"(?:TAG_CHANGE|HIDE_ENTITY -) Entity=(.+) tag=(\w+) value=(
 TAG = re.compile(r"tag=(\w+) value=(\w+)$")
 
 
+def norm(s):
+    return s.lower().replace("\u2019", "'")
+
+
+# ---------------------------------------------------------------- log parsing
 class Game:
     def __init__(self):
         self.reset()
@@ -89,67 +96,33 @@ class Game:
         return False
 
 
-def label(e, names):
-    return names.get(e["card"]) or e["name"] or e["card"] or "?"
+class Follower:
+    """Finds the newest Power.log and feeds new lines to a Game."""
+    def __init__(self, a, prefix):
+        self.a, self.prefix, self.g = a, prefix, Game()
+        self.f, self.path, self.checked, self.msg = None, "", 0.0, ""
 
-
-def render(g, names, deck):
-    me = g.me
-    mine = [e for e in g.ents.values() if me and e["ctrl"] == me]
-    opp = [e for e in g.ents.values() if me and e["ctrl"] == 3 - me]
-    count = lambda es, z: sum(e["zone"] == z for e in es)
-    out = [f"turn {g.turn}   you = player {me or '?'}",
-           f"you: deck {count(mine, 'DECK')} hand {count(mine, 'HAND')}"
-           f"    opp: deck {count(opp, 'DECK')} hand {count(opp, 'HAND')}", ""]
-    hand = sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"])
-    out.append("HAND: " + (", ".join(hand) or "-"))
-    drawn = [e for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]]
-    if deck:
-        left = {k: v[1] for k, v in deck.items()}
-        for e in drawn:
-            k = label(e, names).lower()
-            if k in left: left[k] -= 1
-        size = max(count(mine, "DECK"), 1)
-        out += ["", f"DECK ({count(mine, 'DECK')} cards left)"]
-        out += [f"  {c}x {deck[k][0]}  {100 * c // size}%" for k, c in sorted(left.items()) if c > 0]
-    else:
-        out += ["", f"DRAWN ({len(drawn)})"]
-        out += [f"  {c}x {n}" for n, c in sorted(Counter(label(e, names) for e in drawn).items())]
-    seen = Counter(label(e, names) for e in opp if e["played"] and e["card"])
-    out += ["", f"OPPONENT PLAYED ({sum(seen.values())})"]
-    out += [f"  {c}x {n}" for n, c in sorted(seen.items())]
-    if sys.stdout.isatty(): sys.stdout.write("\033[2J\033[H")
-    print("\n".join(out), flush=True)
-
-
-def load_names():
-    try:
-        with open(CACHE, encoding="utf-8") as f: return json.load(f)
-    except (OSError, ValueError):
-        pass
-    try:
-        req = urllib.request.Request(CARDS_URL, headers={"User-Agent": "hstrack"})
-        with urllib.request.urlopen(req, timeout=30) as r: cards = json.load(r)
-        names = {c["id"]: c["name"] for c in cards if "name" in c}
-        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-        with open(CACHE, "w", encoding="utf-8") as f: json.dump(names, f)
-        return names
-    except Exception as ex:
-        print(f"no card-name database ({ex}); using names from the log", file=sys.stderr)
-        return {}
-
-
-def load_deck(path):
-    deck = {}
-    with open(path, encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln or ln.startswith("#"): continue
-            m = re.match(r"(\d+)\s*x?\s+(.+)$", ln)
-            n, name = (int(m[1]), m[2]) if m else (1, ln)
-            k = name.lower()
-            deck[k] = (name, deck.get(k, ("", 0))[1] + n)
-    return deck
+    def poll(self):
+        if self.a.log: want = self.a.log
+        elif time.time() - self.checked > 5: want, self.checked = find_log(self.prefix), time.time()
+        else: want = self.path
+        changed = False
+        if want != self.path:
+            if self.f: self.f.close()
+            self.path = want
+            try: self.f = open(want, encoding="utf-8", errors="replace") if want else None
+            except OSError as ex: sys.exit(f"cannot open {want}: {ex}")
+            self.g.reset()
+            changed = True
+            self.msg = "" if want else (f"waiting for Power.log under {self.prefix}\n"
+                                        "(run --setup once, then start Hearthstone)")
+        while self.f:
+            pos = self.f.tell()
+            line = self.f.readline()
+            if not line.endswith("\n"):   # EOF or half-written line
+                self.f.seek(pos); break
+            changed |= self.g.feed(line)
+        return changed
 
 
 def find_log(prefix):
@@ -171,43 +144,240 @@ def setup(prefix):
     print("wrote", p, "- restart Hearthstone for it to take effect")
 
 
+# ---------------------------------------------------------------- cards + decks
+def load_db():
+    """{cardId: [name, cost, dbfId, collectible]}, downloaded once from HearthstoneJSON."""
+    try:
+        with open(DB_CACHE, encoding="utf-8") as f: return json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        req = urllib.request.Request(CARDS_URL, headers={"User-Agent": "hstrack"})
+        with urllib.request.urlopen(req, timeout=30) as r: cards = json.load(r)
+        db = {c["id"]: [c["name"], c.get("cost"), c.get("dbfId"), int(bool(c.get("collectible")))]
+              for c in cards if "name" in c}
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(DB_CACHE, "w", encoding="utf-8") as f: json.dump(db, f)
+        return db
+    except Exception as ex:
+        print(f"no card database ({ex}); deck codes won't work and costs are unknown", file=sys.stderr)
+        return {}
+
+
+def decode_deckstring(code):
+    """Hearthstone deck code -> {dbfId: copies}."""
+    data = base64.b64decode(code + "=" * (-len(code) % 4))
+    pos = 0
+
+    def varint():
+        nonlocal pos
+        shift = res = 0
+        while True:
+            b = data[pos]; pos += 1
+            res |= (b & 0x7F) << shift
+            if not b & 0x80: return res
+            shift += 7
+
+    if varint() != 0: raise ValueError("bad reserved byte")
+    varint(); varint()                      # version, format
+    for _ in range(varint()): varint()      # heroes
+    cards = {}
+    for copies in (1, 2):
+        for _ in range(varint()): cards[varint()] = copies
+    for _ in range(varint()):
+        dbf = varint(); cards[dbf] = varint()
+    return cards
+
+
+def parse_deck(text, db):
+    """Deck code (Hearthstone's copy-deck button) or lines like '2 Fireball' -> {key: [name, n, cost]}."""
+    by_name = {}
+    for nm, cost, dbf, col in db.values():
+        if norm(nm) not in by_name or col: by_name[norm(nm)] = cost
+    deck = {}
+
+    def add(name, n, cost=None):
+        item = deck.setdefault(norm(name), [name, 0, cost if cost is not None else by_name.get(norm(name))])
+        item[1] += n
+
+    lines = [ln.strip() for ln in text.splitlines()]
+    code = next((ln for ln in lines if re.fullmatch(r"[A-Za-z0-9+/]{20,}={0,2}", ln)), None)
+    if code:
+        if not db: raise ValueError("deck codes need the card database (no internet?)")
+        by_dbf = {v[2]: v for v in db.values() if v[2] is not None}
+        try: cards = decode_deckstring(code)
+        except Exception: raise ValueError("couldn't decode that deck code")
+        for dbf, n in cards.items():
+            if dbf in by_dbf: add(by_dbf[dbf][0], n, by_dbf[dbf][1])
+    else:
+        for ln in lines:
+            if not ln: continue
+            m = re.match(r"#\s*(\d+)x\s*\(\d+\)\s*(.+)$", ln)      # "# 2x (1) Fireball" from copied decks
+            if m: add(m[2].strip(), int(m[1])); continue
+            if ln.startswith("#"): continue
+            m = re.match(r"(\d+)\s*x?\s+(.+)$", ln)
+            if m: add(m[2].strip(), int(m[1]))
+            else: add(ln, 1)
+    if not deck: raise ValueError("no cards found in that text")
+    return deck
+
+
+def save_deck(text):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(DECK_CACHE, "w", encoding="utf-8") as f: f.write(text)
+
+
+# ---------------------------------------------------------------- views
+def label(e, names):
+    return names.get(e["card"]) or e["name"] or e["card"] or "?"
+
+
+def summary(g, names, deck):
+    me = g.me
+    mine = [e for e in g.ents.values() if me and e["ctrl"] == me]
+    opp = [e for e in g.ents.values() if me and e["ctrl"] == 3 - me]
+    count = lambda es, z: sum(e["zone"] == z for e in es)
+    drawn = [e for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]]
+    left = {k: list(v) for k, v in deck.items()}
+    for e in drawn:
+        k = norm(label(e, names))
+        if k in left: left[k][1] -= 1
+    rows = sorted(((v[2], v[0], v[1]) for v in left.values() if v[1] > 0),
+                  key=lambda r: (99 if r[0] is None else r[0], norm(r[1])))
+    deck_n = count(mine, "DECK")
+    total = deck_n if me else sum(r[2] for r in rows)
+    return dict(turn=g.turn, me=me, deck_n=deck_n, hand_n=count(mine, "HAND"), total=total,
+                size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
+                hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
+                drawn=Counter(label(e, names) for e in drawn),
+                opp=Counter(label(e, names) for e in opp if e["played"] and e["card"]))
+
+
+def fmt_rows(s):
+    w = max([len(r[1]) for r in s["rows"]] or [0])
+    return [f"{'-' if c is None else c:>2} {nm:<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n in s["rows"]]
+
+
+def text_view(s, have_deck):
+    out = [f"turn {s['turn']}   you = player {s['me'] or '?'}",
+           f"you: deck {s['deck_n']} hand {s['hand_n']}    opp: deck {s['opp_deck']} hand {s['opp_hand']}",
+           "", "HAND: " + (", ".join(s["hand"]) or "-"), ""]
+    if have_deck:
+        out += [f"DECK ({s['total']} cards left)"] + ["  " + r for r in fmt_rows(s)]
+    else:
+        out += [f"DRAWN ({sum(s['drawn'].values())})"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
+    out += ["", f"OPPONENT PLAYED ({sum(s['opp'].values())})"]
+    out += [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
+    return "\n".join(out)
+
+
+def overlay_text(s, have_deck, err, show_opp):
+    if not have_deck:
+        return (err + "\n\n" if err else "") + "no deck loaded.\nCopy your deck in Hearthstone,\nthen click 'paste' above."
+    out = [f"{s['total']} cards left   (turn {s['turn']})"] + fmt_rows(s)
+    if err: out += ["", err]
+    if show_opp:
+        out += ["", "opp played:"] + [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
+    return "\n".join(out)
+
+
+def run_overlay(a, fol, db, names, state):
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+    except ImportError:
+        sys.exit("tkinter is missing - on Void: sudo xbps-install -S python3-tkinter")
+    BG, FG, DIM = "#0d1117", "#e6edf3", "#8b949e"
+    try: root = tk.Tk()
+    except tk.TclError as ex: sys.exit(f"can't open a window: {ex}")
+    root.title("hstrack")
+    root.overrideredirect(True)            # no title bar; drag the header to move
+    root.attributes("-topmost", True)
+    try: root.attributes("-alpha", a.alpha)   # needs a compositor (xfwm4: Window Manager Tweaks)
+    except tk.TclError: pass
+    root.configure(bg=BG)
+    root.geometry(a.pos)
+    fnt = tkfont.nametofont("TkFixedFont").copy()
+    fnt.configure(size=a.size)
+
+    def refresh():
+        s = summary(fol.g, names, state["deck"])
+        text = overlay_text(s, bool(state["deck"]), state["err"], a.opp)
+        if fol.msg: text += "\n\n" + fol.msg
+        if body.cget("text") != text: body.config(text=text)
+
+    def paste():
+        try: text = root.clipboard_get()
+        except tk.TclError:
+            state["err"] = "clipboard is empty"; refresh(); return
+        try: state["deck"] = parse_deck(text, db)
+        except ValueError as ex:
+            state["err"] = str(ex); refresh(); return
+        state["err"] = ""
+        save_deck(text)
+        refresh()
+
+    bar = tk.Frame(root, bg=BG); bar.pack(fill="x")
+    title = tk.Label(bar, text="hstrack", fg=DIM, bg=BG, font=fnt); title.pack(side="left", padx=4)
+    for txt, cmd in (("x", root.destroy), ("paste", paste)):
+        b = tk.Label(bar, text=txt, fg=DIM, bg=BG, font=fnt, cursor="hand2"); b.pack(side="right", padx=4)
+        b.bind("<Button-1>", lambda e, c=cmd: c())
+    body = tk.Label(root, text="", justify="left", anchor="nw", fg=FG, bg=BG, font=fnt, padx=6, pady=4)
+    body.pack(fill="both")
+
+    grab = {}
+    def start(e): grab["dx"], grab["dy"] = e.x_root - root.winfo_x(), e.y_root - root.winfo_y()
+    def move(e): root.geometry(f"+{e.x_root - grab['dx']}+{e.y_root - grab['dy']}")
+    for w in (bar, title, body):
+        w.bind("<ButtonPress-1>", start); w.bind("<B1-Motion>", move)
+
+    def tick():
+        if fol.poll(): refresh()
+        root.lift()                        # stay above the game window
+        root.after(500, tick)
+
+    refresh(); tick()
+    try: root.mainloop()
+    except KeyboardInterrupt: pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tiny Hearthstone tracker (follows Power.log)")
     ap.add_argument("--prefix", default=os.environ.get("HS_PREFIX", "~/Games/battlenet"),
                     help="Wine prefix containing Hearthstone (default: $HS_PREFIX or ~/Games/battlenet)")
     ap.add_argument("--log", help="read this Power.log instead of searching the prefix")
-    ap.add_argument("--deck", help="decklist file, one card per line, e.g. '2 Fireball'")
-    ap.add_argument("--once", action="store_true", help="parse once, print, exit")
+    ap.add_argument("--deck", help="deck file or deck code (default: the last deck you pasted)")
+    ap.add_argument("-o", "--overlay", action="store_true", help="show the always-on-top overlay window")
+    ap.add_argument("--pos", default="+20+120", help="overlay position, e.g. +20+120 (drag the header to move)")
+    ap.add_argument("--alpha", type=float, default=0.88, help="overlay opacity 0.2-1.0")
+    ap.add_argument("--size", type=int, default=11, help="overlay font size")
+    ap.add_argument("--opp", action="store_true", help="also list opponent's played cards in the overlay")
+    ap.add_argument("--once", action="store_true", help="terminal mode: parse once, print, exit")
     ap.add_argument("--setup", action="store_true", help="make Hearthstone write Power.log, then exit")
     a = ap.parse_args()
     prefix = os.path.expanduser(a.prefix)
     if a.setup: return setup(prefix)
 
-    names = load_names()
-    deck = load_deck(a.deck) if a.deck else {}
-    g, f, path, checked = Game(), None, "", 0.0
+    db = load_db()
+    names = {k: v[0] for k, v in db.items()}
+    state = {"deck": {}, "err": ""}
+    src = a.deck if a.deck else None
+    if src and os.path.isfile(src):
+        with open(src, encoding="utf-8") as f: src = f.read()
+    elif not src and os.path.isfile(DECK_CACHE):
+        with open(DECK_CACHE, encoding="utf-8") as f: src = f.read()
+    if src:
+        try: state["deck"] = parse_deck(src, db)
+        except ValueError as ex: print(f"deck: {ex}", file=sys.stderr)
+
+    fol = Follower(a, prefix)
+    if a.overlay: return run_overlay(a, fol, db, names, state)
     while True:
-        if a.log: want = a.log
-        elif time.time() - checked > 5: want, checked = find_log(prefix), time.time()
-        else: want = path
-        changed = False
-        if want != path:
-            if f: f.close()
-            path = want
-            try: f = open(path, encoding="utf-8", errors="replace") if path else None
-            except OSError as ex: sys.exit(f"cannot open {path}: {ex}")
-            g.reset()
-            changed = bool(path)
-            if not path:
-                print(f"no Power.log under {prefix} yet - run --setup once, start Hearthstone, "
-                      f"or pass --prefix / --log", file=sys.stderr)
-        while f:
-            pos = f.tell()
-            line = f.readline()
-            if not line.endswith("\n"):   # EOF or half-written line
-                f.seek(pos); break
-            changed |= g.feed(line)
-        if changed: render(g, names, deck)
+        if fol.poll():
+            if fol.msg: print(fol.msg, file=sys.stderr)
+            else:
+                if sys.stdout.isatty(): sys.stdout.write("\033[2J\033[H")
+                print(text_view(summary(fol.g, names, state["deck"]), bool(state["deck"])), flush=True)
         if a.once: break
         time.sleep(0.5)
 
