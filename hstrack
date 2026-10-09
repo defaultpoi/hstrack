@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """hstrack - tiny Hearthstone tracker with a remaining-deck overlay. Follows Power.log, stdlib only."""
-import argparse, base64, glob, json, os, re, sys, time, urllib.request
+import argparse, base64, glob, hashlib, json, os, re, sys, time, urllib.request
 from collections import Counter
 
 CARDS_URL = "https://api.hearthstonejson.com/v1/latest/enUS/cards.json"
 CACHE_DIR = os.path.expanduser("~/.cache/hstrack")
 DB_CACHE = os.path.join(CACHE_DIR, "cards2.json")
 DECK_CACHE = os.path.join(CACHE_DIR, "last_deck.txt")
+LEARN_CACHE = os.path.join(CACHE_DIR, "learned.json")
 LOG_CONFIG = """[Power]
 LogLevel=1
 FilePrinting=true
@@ -21,6 +22,8 @@ FULL = re.compile(r"FULL_ENTITY - Creating ID=(\d+) CardID=(\w*)")
 SHOW = re.compile(r"(?:SHOW|CHANGE)_ENTITY - Updating Entity=(.+) CardID=(\w*)$")
 CHANGE = re.compile(r"(?:TAG_CHANGE|HIDE_ENTITY -) Entity=(.+) tag=(\w+) value=(\w+)$")
 TAG = re.compile(r"tag=(\w+) value=(\w+)$")
+GTYPE = re.compile(r"GameType=(\w+)")
+PLAYER = re.compile(r"PlayerID=(\d+), PlayerName=(.*)$")
 
 
 def norm(s):
@@ -34,10 +37,12 @@ class Game:
 
     def reset(self):
         self.ents, self.me, self.turn, self.cur = {}, None, 0, None
+        self.mode, self.players = "", {}
 
     def ent(self, eid):
         return self.ents.setdefault(eid, dict(card="", name="", zone=None, ctrl=None,
-                                              left_deck=False, played=False))
+                                              left_deck=False, played=False,
+                                              init=self.turn == 0))
 
     def ref(self, text):
         m = BRACKET.search(text)
@@ -62,6 +67,17 @@ class Game:
 
     def feed(self, line):
         """Process one log line; True if the tracked state may have changed."""
+        if "GameState.DebugPrintGame" in line:
+            s = line.split(" - ", 1)[-1].strip()
+            if (m := GTYPE.match(s)):
+                self.mode = m[1]; return True
+            if (m := PLAYER.match(s)):
+                # the opponent is "UNKNOWN HUMAN PLAYER" in your own log -> the other id is you
+                self.players[int(m[1])] = m[2].strip()
+                hidden = [p for p, n in self.players.items() if n.startswith("UNKNOWN")]
+                if len(self.players) == 2 and len(hidden) == 1: self.me = 3 - hidden[0]
+                return True
+            return False
         if "GameState.DebugPrintPower" not in line: return False
         m = PWR.search(line)
         if not m: return False
@@ -84,7 +100,7 @@ class Game:
             return True
         if (m := CHANGE.match(s)):
             self.cur = None
-            if m[1] == "GameEntity":
+            if m[1] in ("GameEntity", "1"):
                 if m[2] == "TURN": self.turn = int(m[3]); return True
                 return False
             e = self.ref(m[1])
@@ -189,26 +205,33 @@ def decode_deckstring(code):
     return cards
 
 
+def entry(name, n, cost=None, ids=(), exact=False):
+    return {"name": name, "n": n, "cost": cost, "ids": set(ids), "exact": exact}
+
+
 def parse_deck(text, db):
-    """Deck code (Hearthstone's copy-deck button) or lines like '2 Fireball' -> {key: [name, n, cost]}."""
+    """Deck code (Hearthstone's copy-deck button) or lines like '2 Fireball' -> {key: entry}."""
     by_name = {}
     for nm, cost, dbf, col in db.values():
         if norm(nm) not in by_name or col: by_name[norm(nm)] = cost
     deck = {}
 
-    def add(name, n, cost=None):
-        item = deck.setdefault(norm(name), [name, 0, cost if cost is not None else by_name.get(norm(name))])
-        item[1] += n
+    def add(name, n, cost=None, cid=None):
+        d = deck.setdefault(norm(name), entry(name, 0, cost if cost is not None else by_name.get(norm(name)), exact=True))
+        d["n"] += n
+        if cid: d["ids"].add(cid)
 
     lines = [ln.strip() for ln in text.splitlines()]
     code = next((ln for ln in lines if re.fullmatch(r"[A-Za-z0-9+/]{20,}={0,2}", ln)), None)
     if code:
         if not db: raise ValueError("deck codes need the card database (no internet?)")
-        by_dbf = {v[2]: v for v in db.values() if v[2] is not None}
+        by_dbf = {v[2]: (cid, v) for cid, v in db.items() if v[2] is not None}
         try: cards = decode_deckstring(code)
         except Exception: raise ValueError("couldn't decode that deck code")
         for dbf, n in cards.items():
-            if dbf in by_dbf: add(by_dbf[dbf][0], n, by_dbf[dbf][1])
+            if dbf in by_dbf:
+                cid, v = by_dbf[dbf]
+                add(v[0], n, v[1], cid)
     else:
         for ln in lines:
             if not ln: continue
@@ -227,29 +250,129 @@ def save_deck(text):
     with open(DECK_CACHE, "w", encoding="utf-8") as f: f.write(text)
 
 
+def load_learned():
+    try:
+        with open(LEARN_CACHE, encoding="utf-8") as f: return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_learned(data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(LEARN_CACHE, "w", encoding="utf-8") as f: json.dump(data, f)
+
+
+# ---------------------------------------------------------------- arena deck (from Arena.log)
+def read_arena(path):
+    """-> (card ids of the latest draft-deck listing, Counter of draft picks since the draft began)."""
+    ids, picks = [], Counter()
+    try: f = open(path, encoding="utf-8", errors="replace")
+    except OSError: return ids, picks
+    with f:
+        for ln in f:
+            if "Draft Deck ID" in ln: ids = []
+            elif "Draft deck contains card" in ln:
+                m = re.search(r"contains card (\w+)", ln)
+                if m and m[1] not in ids: ids.append(m[1])
+            elif "DraftManager.OnBegin" in ln: picks = Counter()
+            elif "Client chooses:" in ln:
+                m = re.search(r"\((\w+)\)\s*$", ln.strip())
+                if m: picks[m[1]] += 1
+    return ids, picks
+
+
+class ArenaSource:
+    """Arena deck from the Arena.log beside the current Power.log (else the newest older session with one).
+    Arena.log lists each distinct card once, so copy counts start from your draft picks and get
+    corrected as copies show up in games (see summary())."""
+    def __init__(self, db):
+        self.db, self.memo = db, {}
+
+    def get(self, power_log):
+        if not power_log: return None
+        d = os.path.dirname(power_log)
+        older = sorted((p for p in glob.glob(os.path.join(os.path.dirname(d), "Hearthstone_*")) if p < d), reverse=True)
+        for folder in [d] + older[:8]:
+            p = os.path.join(folder, "Arena.log")
+            try: mt = os.path.getmtime(p)
+            except OSError: continue
+            if self.memo.get(p, (None,))[0] != mt: self.memo[p] = (mt, read_arena(p))
+            ids, picks = self.memo[p][1]
+            if ids:
+                deck = {}
+                for cid in ids:
+                    rec = self.db.get(cid)
+                    name = rec[0] if rec else cid
+                    e = deck.setdefault(norm(name), entry(name, 0, rec[1] if rec else None))
+                    e["n"] += max(picks.get(cid, 0), 1)
+                    e["ids"].add(cid)
+                return deck, hashlib.md5(",".join(sorted(ids)).encode()).hexdigest()[:12]
+        return None
+
+
+def choose_deck(g, state, arena, path):
+    """Arena games use the deck from Arena.log; everything else uses the deck you pasted."""
+    if "ARENA" in g.mode.upper():
+        got = arena.get(path)
+        if got: return got[0], "arena", state["learned"].setdefault(got[1], {})
+        return {}, "arena (no deck yet)", {}
+    return state["deck"], "pasted", {}
+
+
 # ---------------------------------------------------------------- views
 def label(e, names):
     return names.get(e["card"]) or e["name"] or e["card"] or "?"
 
 
-def summary(g, names, deck):
+def summary(g, names, db, deck, learned):
     me = g.me
-    mine = [e for e in g.ents.values() if me and e["ctrl"] == me]
-    opp = [e for e in g.ents.values() if me and e["ctrl"] == 3 - me]
+    ents = list(g.ents.values())
+    mine = [e for e in ents if me and e["ctrl"] == me]
+    opp = [e for e in ents if me and e["ctrl"] == 3 - me]
     count = lambda es, z: sum(e["zone"] == z for e in es)
-    drawn = [e for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]]
-    left = {k: list(v) for k, v in deck.items()}
-    for e in drawn:
-        k = norm(label(e, names))
-        if k in left: left[k][1] -= 1
-    rows = sorted(((v[2], v[0], v[1]) for v in left.values() if v[1] > 0),
-                  key=lambda r: (99 if r[0] is None else r[0], norm(r[1])))
+    by_id = {cid: k for k, d in deck.items() for cid in d["ids"]}
+
+    def key_of(e):
+        k = by_id.get(e["card"])
+        if k is None:
+            nk = norm(label(e, names))
+            k = nk if nk in deck else None
+        return k
+
+    # copies of each listed card that have left your starting deck so far
+    drawn, changed = Counter(), False
+    for e in mine:
+        if e["init"] and e["left_deck"] and e["card"]:
+            k = key_of(e)
+            if k: drawn[k] += 1
+    for k, v in drawn.items():                      # remember the most copies ever seen of a card
+        if v > learned.get(k, 0): learned[k] = v; changed = True
+    # copy counts: your best estimate, never below what has been seen; trimmed if the total exceeds the deck size
+    start_n = sum(1 for e in mine if e["init"] and (e["zone"] == "DECK" or e["left_deck"]))
+    est = {k: max(d["n"], learned.get(k, 0)) for k, d in deck.items()}
+    over = sum(est.values()) - start_n if start_n else 0
+    while over > 0:
+        spare = [k for k, d in deck.items() if not d["exact"] and est[k] > max(1, learned.get(k, 0))]
+        if not spare: break
+        k = max(spare, key=lambda k: (est[k] - learned.get(k, 0), k))
+        est[k] -= 1; over -= 1
+    rem = {k: est[k] - drawn[k] for k in deck}
+    meta = {k: (d["name"], d["cost"]) for k, d in deck.items()}
+    for e in mine:                                  # cards shuffled into / created in your deck mid-game
+        if not e["init"] and e["zone"] == "DECK" and e["card"]:
+            k = key_of(e) or "+" + norm(label(e, names))
+            rem[k] = rem.get(k, 0) + 1
+            meta.setdefault(k, (label(e, names), (db.get(e["card"]) or [0, None])[1]))
     deck_n = count(mine, "DECK")
+    rows = [(meta[k][1], meta[k][0], n) for k, n in rem.items() if n > 0]
+    unknown = deck_n - sum(r[2] for r in rows) if me and deck else 0
+    if unknown > 0: rows.append((None, "(unknown)", unknown))
+    rows.sort(key=lambda r: (99 if r[0] is None else r[0], norm(r[1])))
     total = deck_n if me else sum(r[2] for r in rows)
-    return dict(turn=g.turn, me=me, deck_n=deck_n, hand_n=count(mine, "HAND"), total=total,
-                size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
+    return dict(turn=g.turn, me=me, mode=g.mode, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
+                total=total, size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
-                drawn=Counter(label(e, names) for e in drawn),
+                drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
                 opp=Counter(label(e, names) for e in opp if e["played"] and e["card"]))
 
 
@@ -258,30 +381,32 @@ def fmt_rows(s):
     return [f"{'-' if c is None else c:>2} {nm:<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n in s["rows"]]
 
 
-def text_view(s, have_deck):
-    out = [f"turn {s['turn']}   you = player {s['me'] or '?'}",
+def text_view(s, deck, src):
+    out = [f"turn {s['turn']}   you = player {s['me'] or '?'}   {s['mode'] or 'no game yet'}",
            f"you: deck {s['deck_n']} hand {s['hand_n']}    opp: deck {s['opp_deck']} hand {s['opp_hand']}",
            "", "HAND: " + (", ".join(s["hand"]) or "-"), ""]
-    if have_deck:
-        out += [f"DECK ({s['total']} cards left)"] + ["  " + r for r in fmt_rows(s)]
+    if deck:
+        out += [f"DECK ({s['total']} cards left)  [{src}]"] + ["  " + r for r in fmt_rows(s)]
     else:
-        out += [f"DRAWN ({sum(s['drawn'].values())})"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
+        out += [f"DRAWN ({sum(s['drawn'].values())})  [{src}]"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
     out += ["", f"OPPONENT PLAYED ({sum(s['opp'].values())})"]
     out += [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
     return "\n".join(out)
 
 
-def overlay_text(s, have_deck, err, show_opp):
-    if not have_deck:
+def overlay_text(s, deck, src, err, show_opp):
+    if not deck:
+        if src.startswith("arena"):
+            return "arena deck not in Arena.log yet.\nIt is written when you are back\non the Arena screen."
         return (err + "\n\n" if err else "") + "no deck loaded.\nCopy your deck in Hearthstone,\nthen click 'paste' above."
-    out = [f"{s['total']} cards left   (turn {s['turn']})"] + fmt_rows(s)
+    out = [f"{s['total']} cards left   turn {s['turn']}   [{src}]"] + fmt_rows(s)
     if err: out += ["", err]
     if show_opp:
         out += ["", "opp played:"] + [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
     return "\n".join(out)
 
 
-def run_overlay(a, fol, db, names, state):
+def run_overlay(a, fol, db, names, state, arena):
     try:
         import tkinter as tk
         from tkinter import font as tkfont
@@ -301,8 +426,10 @@ def run_overlay(a, fol, db, names, state):
     fnt.configure(size=a.size)
 
     def refresh():
-        s = summary(fol.g, names, state["deck"])
-        text = overlay_text(s, bool(state["deck"]), state["err"], a.opp)
+        deck, src, learned = choose_deck(fol.g, state, arena, fol.path)
+        s = summary(fol.g, names, db, deck, learned)
+        if s["changed"]: save_learned(state["learned"])
+        text = overlay_text(s, deck, src, state["err"], a.opp)
         if fol.msg: text += "\n\n" + fol.msg
         if body.cget("text") != text: body.config(text=text)
 
@@ -346,7 +473,7 @@ def main():
     ap.add_argument("--prefix", default=os.environ.get("HS_PREFIX", "~/Games/battlenet"),
                     help="Wine prefix containing Hearthstone (default: $HS_PREFIX or ~/Games/battlenet)")
     ap.add_argument("--log", help="read this Power.log instead of searching the prefix")
-    ap.add_argument("--deck", help="deck file or deck code (default: the last deck you pasted)")
+    ap.add_argument("--deck", help="deck file or deck code for non-arena games (default: the last deck you pasted)")
     ap.add_argument("-o", "--overlay", action="store_true", help="show the always-on-top overlay window")
     ap.add_argument("--pos", default="+20+120", help="overlay position, e.g. +20+120 (drag the header to move)")
     ap.add_argument("--alpha", type=float, default=0.88, help="overlay opacity 0.2-1.0")
@@ -360,7 +487,7 @@ def main():
 
     db = load_db()
     names = {k: v[0] for k, v in db.items()}
-    state = {"deck": {}, "err": ""}
+    state = {"deck": {}, "err": "", "learned": load_learned()}
     src = a.deck if a.deck else None
     if src and os.path.isfile(src):
         with open(src, encoding="utf-8") as f: src = f.read()
@@ -370,14 +497,17 @@ def main():
         try: state["deck"] = parse_deck(src, db)
         except ValueError as ex: print(f"deck: {ex}", file=sys.stderr)
 
-    fol = Follower(a, prefix)
-    if a.overlay: return run_overlay(a, fol, db, names, state)
+    fol, arena = Follower(a, prefix), ArenaSource(db)
+    if a.overlay: return run_overlay(a, fol, db, names, state, arena)
     while True:
         if fol.poll():
             if fol.msg: print(fol.msg, file=sys.stderr)
             else:
+                deck, how, learned = choose_deck(fol.g, state, arena, fol.path)
+                s = summary(fol.g, names, db, deck, learned)
+                if s["changed"]: save_learned(state["learned"])
                 if sys.stdout.isatty(): sys.stdout.write("\033[2J\033[H")
-                print(text_view(summary(fol.g, names, state["deck"]), bool(state["deck"])), flush=True)
+                print(text_view(s, deck, how), flush=True)
         if a.once: break
         time.sleep(0.5)
 
