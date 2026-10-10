@@ -45,12 +45,26 @@ In Hearthstone copy your deck, then click **paste** in the overlay header. The d
 is remembered in `~/.cache/hstrack/last_deck.txt`. You can also use
 `--deck deck.txt` (lines like `2 Fireball`) or `--deck <deck code>`.
 
+### Card pictures
+
+Hover a card in the list to see its picture in a second window beside the overlay
+(on the left if there is no room on the right). With `--opp` the opponent's played
+cards work the same way. Pictures come from HearthstoneJSON
+(`art.hearthstonejson.com`), are downloaded in the background as soon as your deck
+is known, and are cached in `~/.cache/hstrack/img`, so hovering is instant and the
+first download is the only one. If a card has no picture the popup says so.
+Card art is Blizzard's; this is for personal use. Disable with `--no-images`.
+
 ## Options
 
-`--pos +20+120` start position (drag the header to move), `--size 13` font size,
-`--alpha 0.9` opacity, `--opp` also list the cards the opponent played. Without
-`--overlay` you get a terminal view; `--once` parses once and exits;
-`--log /path/to/Power.log` reads a specific file.
+`--pos +20+120` start position (drag the header to move), `--size 12` font size
+(default 10), `--alpha 0.9` opacity, `--opp` also list the cards the opponent
+played, `--no-images` no hover pictures, `--img-url` picture URL template with
+`{id}`. Without `--overlay` you get a terminal view; `--once` parses once and
+exits; `--log /path/to/Power.log` reads a specific file.
+
+Card names longer than 17 characters are shortened with an ellipsis to keep the
+window narrow; the hover picture shows the full card.
 
 ## Notes
 
@@ -59,6 +73,6 @@ is remembered in `~/.cache/hstrack/last_deck.txt`. You can also use
 - The overlay is not click-through; park it over empty screen space.
 - Card names/costs come from HearthstoneJSON, downloaded once to
   `~/.cache/hstrack/cards2.json` (delete it to refresh after an expansion).
-- Tested against real Underground Arena logs (7 games, 3 deck versions) and a
-  virtual X server. Constructed games and the clipboard paste are not yet
-  verified against a real game under Wine.
+- Tested against real Underground Arena and ranked logs, and on a virtual X
+  server (layout, hover popup with a local image server). The clipboard paste and
+  the live picture download are not yet verified against a real game under Wine.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hstrack - tiny Hearthstone tracker with a remaining-deck overlay. Follows Power.log, stdlib only."""
-import argparse, base64, glob, hashlib, json, os, re, sys, time, urllib.request
+import argparse, base64, glob, hashlib, json, os, queue, re, sys, textwrap, threading, time, urllib.request
 from collections import Counter
 
 CARDS_URL = "https://api.hearthstonejson.com/v1/latest/enUS/cards.json"
@@ -8,6 +8,9 @@ CACHE_DIR = os.path.expanduser("~/.cache/hstrack")
 DB_CACHE = os.path.join(CACHE_DIR, "cards2.json")
 DECK_CACHE = os.path.join(CACHE_DIR, "last_deck.txt")
 LEARN_CACHE = os.path.join(CACHE_DIR, "learned.json")
+IMG_DIR = os.path.join(CACHE_DIR, "img")
+IMG_URL = "https://art.hearthstonejson.com/v1/render/latest/enUS/256x/{id}.png"
+NAME_W = 17
 LOG_CONFIG = """[Power]
 LogLevel=1
 FilePrinting=true
@@ -211,15 +214,17 @@ def entry(name, n, cost=None, ids=(), exact=False):
 
 def parse_deck(text, db):
     """Deck code (Hearthstone's copy-deck button) or lines like '2 Fireball' -> {key: entry}."""
-    by_name = {}
-    for nm, cost, dbf, col in db.values():
-        if norm(nm) not in by_name or col: by_name[norm(nm)] = cost
+    by_name = {}                                       # name -> (cost, a card id for its picture)
+    for cid, (nm, cost, dbf, col) in db.items():
+        if norm(nm) not in by_name or col: by_name[norm(nm)] = (cost, cid)
     deck = {}
 
     def add(name, n, cost=None, cid=None):
-        d = deck.setdefault(norm(name), entry(name, 0, cost if cost is not None else by_name.get(norm(name)), exact=True))
+        k = norm(name)
+        bcost, bid = by_name.get(k, (None, None))
+        d = deck.setdefault(k, entry(name, 0, cost if cost is not None else bcost, exact=True))
         d["n"] += n
-        if cid: d["ids"].add(cid)
+        if cid or bid: d["ids"].add(cid or bid)
 
     lines = [ln.strip() for ln in text.splitlines()]
     code = next((ln for ln in lines if re.fullmatch(r"[A-Za-z0-9+/]{20,}={0,2}", ln)), None)
@@ -319,6 +324,49 @@ def choose_deck(g, state, arena, path):
     return state["deck"], "pasted", {}
 
 
+# ---------------------------------------------------------------- card pictures
+class Images:
+    """Card renders from HearthstoneJSON, cached in ~/.cache/hstrack/img and fetched in a background thread."""
+    def __init__(self, url):
+        self.url, self.state, self.q = url, {}, queue.Queue()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def path(self, cid):
+        return os.path.join(IMG_DIR, cid + ".png")
+
+    def want(self, cid):
+        """Path of the cached picture, or None (and a download is queued if it isn't already)."""
+        p = self.path(cid)
+        if os.path.exists(p): return p
+        st = self.state.get(cid)
+        if st is None or (st[0] == "fail" and time.time() - st[1] > 30):
+            self.state[cid] = ("queued", time.time()); self.q.put(cid)
+        return None
+
+    def failed(self, cid):
+        return self.state.get(cid, ("",))[0] == "fail"
+
+    def discard(self, cid):
+        try: os.remove(self.path(cid))
+        except OSError: pass
+        self.state[cid] = ("fail", time.time())
+
+    def _work(self):
+        while True:
+            cid = self.q.get()
+            p = self.path(cid)
+            try:
+                os.makedirs(IMG_DIR, exist_ok=True)
+                req = urllib.request.Request(self.url.format(id=cid), headers={"User-Agent": "hstrack"})
+                with urllib.request.urlopen(req, timeout=15) as r: data = r.read()
+                if not data.startswith(b"\x89PNG"): raise ValueError("not a PNG")
+                with open(p + ".part", "wb") as f: f.write(data)
+                os.replace(p + ".part", p)
+                self.state[cid] = ("ok", time.time())
+            except Exception:
+                self.state[cid] = ("fail", time.time())
+
+
 # ---------------------------------------------------------------- views
 def label(e, names):
     return names.get(e["card"]) or e["name"] or e["card"] or "?"
@@ -357,28 +405,36 @@ def summary(g, names, db, deck, learned):
         k = max(spare, key=lambda k: (est[k] - learned.get(k, 0), k))
         est[k] -= 1; over -= 1
     rem = {k: est[k] - drawn[k] for k in deck}
-    meta = {k: (d["name"], d["cost"]) for k, d in deck.items()}
+    meta = {k: (d["name"], d["cost"], min(d["ids"]) if d["ids"] else None) for k, d in deck.items()}
     for e in mine:                                  # cards shuffled into / created in your deck mid-game
         if not e["init"] and e["zone"] == "DECK" and e["card"]:
             k = key_of(e) or "+" + norm(label(e, names))
             rem[k] = rem.get(k, 0) + 1
-            meta.setdefault(k, (label(e, names), (db.get(e["card"]) or [0, None])[1]))
+            meta.setdefault(k, (label(e, names), (db.get(e["card"]) or [0, None])[1], e["card"]))
     deck_n = count(mine, "DECK")
-    rows = [(meta[k][1], meta[k][0], n) for k, n in rem.items() if n > 0]
+    rows = [(meta[k][1], meta[k][0], n, meta[k][2]) for k, n in rem.items() if n > 0]
     unknown = deck_n - sum(r[2] for r in rows) if me and deck else 0
-    if unknown > 0: rows.append((None, "(unknown)", unknown))
+    if unknown > 0: rows.append((None, "(unknown)", unknown, None))
     rows.sort(key=lambda r: (99 if r[0] is None else r[0], norm(r[1])))
     total = deck_n if me else sum(r[2] for r in rows)
+    played = {}
+    for e in opp:
+        if e["played"] and e["card"]:
+            p = played.setdefault(label(e, names), [0, e["card"]]); p[0] += 1
     return dict(turn=g.turn, me=me, mode=g.mode, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
                 total=total, size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
                 drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
-                opp=Counter(label(e, names) for e in opp if e["played"] and e["card"]))
+                opp=sorted((nm, p[0], p[1]) for nm, p in played.items()))
+
+
+def short(nm):
+    return nm if len(nm) <= NAME_W else nm[:NAME_W - 1] + "\u2026"
 
 
 def fmt_rows(s):
-    w = max([len(r[1]) for r in s["rows"]] or [0])
-    return [f"{'-' if c is None else c:>2} {nm:<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n in s["rows"]]
+    w = min(NAME_W, max([len(r[1]) for r in s["rows"]] or [0]))
+    return [f"{'-' if c is None else c:>2} {short(nm):<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n, cid in s["rows"]]
 
 
 def text_view(s, deck, src):
@@ -389,21 +445,24 @@ def text_view(s, deck, src):
         out += [f"DECK ({s['total']} cards left)  [{src}]"] + ["  " + r for r in fmt_rows(s)]
     else:
         out += [f"DRAWN ({sum(s['drawn'].values())})  [{src}]"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
-    out += ["", f"OPPONENT PLAYED ({sum(s['opp'].values())})"]
-    out += [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
+    out += ["", f"OPPONENT PLAYED ({sum(n for _, n, _ in s['opp'])})"]
+    out += [f"  {n}x {nm}" for nm, n, cid in s["opp"]]
     return "\n".join(out)
 
 
-def overlay_text(s, deck, src, err, show_opp):
+def overlay_lines(s, deck, src, err, show_opp):
+    """[(text, card id or None)] - one overlay row each; rows with a card id show its picture on hover."""
     if not deck:
         if src.startswith("arena"):
-            return "arena deck not in Arena.log yet.\nIt is written when you are back\non the Arena screen."
-        return (err + "\n\n" if err else "") + "no deck loaded.\nCopy your deck in Hearthstone,\nthen click 'paste' above."
-    out = [f"{s['total']} cards left   turn {s['turn']}   [{src}]"] + fmt_rows(s)
-    if err: out += ["", err]
+            return [(t, None) for t in ("arena deck not found", "yet. It appears in", "Arena.log once you are", "on the Arena screen.")]
+        return [(t, None) for t in textwrap.wrap(err, 24) + ([""] if err else [])
+                + ["no deck loaded.", "Copy it in Hearthstone,", "then click 'paste'."]]
+    out = [(f"{s['total']} left  t{s['turn']}  {src}", None)]
+    out += [(txt, r[3]) for txt, r in zip(fmt_rows(s), s["rows"])]
+    if err: out += [("", None)] + [(t, None) for t in textwrap.wrap(err, 24)]
     if show_opp:
-        out += ["", "opp played:"] + [f"  {n}x {c}" for c, n in sorted(s["opp"].items())]
-    return "\n".join(out)
+        out += [("", None), ("opp played:", None)] + [(f" {n}x {short(nm)}", cid) for nm, n, cid in s["opp"]]
+    return out
 
 
 def run_overlay(a, fol, db, names, state, arena):
@@ -412,7 +471,7 @@ def run_overlay(a, fol, db, names, state, arena):
         from tkinter import font as tkfont
     except ImportError:
         sys.exit("tkinter is missing - on Void: sudo xbps-install -S python3-tkinter")
-    BG, FG, DIM = "#0d1117", "#e6edf3", "#8b949e"
+    BG, HI, FG, DIM = "#0d1117", "#1f2a37", "#e6edf3", "#8b949e"
     try: root = tk.Tk()
     except tk.TclError as ex: sys.exit(f"can't open a window: {ex}")
     root.title("hstrack")
@@ -424,14 +483,65 @@ def run_overlay(a, fol, db, names, state, arena):
     root.geometry(a.pos)
     fnt = tkfont.nametofont("TkFixedFont").copy()
     fnt.configure(size=a.size)
+    images = None if a.no_images else Images(a.img_url)
+    pool, shown, photos = [], [0], {}
+    hover = {"row": None, "cid": None, "hide": None}
 
-    def refresh():
-        deck, src, learned = choose_deck(fol.g, state, arena, fol.path)
-        s = summary(fol.g, names, db, deck, learned)
-        if s["changed"]: save_learned(state["learned"])
-        text = overlay_text(s, deck, src, state["err"], a.opp)
-        if fol.msg: text += "\n\n" + fol.msg
-        if body.cget("text") != text: body.config(text=text)
+    # ---- card picture popup (a second borderless window beside the overlay)
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup.configure(bg=BG)
+    popup.withdraw()
+    pic = tk.Label(popup, bg=BG, fg=FG, font=fnt, padx=6, pady=4)
+    pic.pack()
+
+    def hide_card():
+        hover["cid"] = None
+        popup.withdraw()
+
+    def draw_card():
+        row, cid = hover["row"], hover["cid"]
+        if row is None or cid is None: return
+        path, ph = images.want(cid), None
+        if path:
+            try: ph = photos.get(cid) or photos.setdefault(cid, tk.PhotoImage(file=path))
+            except tk.TclError: images.discard(cid)
+        if ph: pic.config(image=ph, text="")
+        else: pic.config(image="", text=f"no picture for {cid}" if images.failed(cid) else "loading picture...")
+        popup.update_idletasks()
+        w, h = popup.winfo_reqwidth(), popup.winfo_reqheight()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        x = root.winfo_rootx() + root.winfo_width() + 6          # right of the overlay, else left
+        if x + w > sw: x = max(0, root.winfo_rootx() - w - 6)
+        y = max(0, min(row.winfo_rooty() + row.winfo_height() // 2 - h // 2, sh - h))
+        popup.geometry(f"+{x}+{y}")
+        popup.deiconify(); popup.lift()
+        if not ph and not images.failed(cid): root.after(200, poll, row, cid)   # still downloading
+
+    def poll(row, cid):
+        if hover["row"] is row and hover["cid"] == cid: draw_card()
+
+    def show_card(row):
+        if images is None or not row.cid: hide_card(); return
+        hover["cid"] = row.cid
+        draw_card()
+
+    def enter(row):
+        if hover["hide"]: root.after_cancel(hover["hide"]); hover["hide"] = None
+        hover["row"] = row
+        if row.cid: row.config(bg=HI)
+        show_card(row)
+
+    def leave(row):
+        row.config(bg=BG)
+        if hover["row"] is row: hover["row"] = None
+        hover["hide"] = root.after(80, hide_card)
+
+    # ---- window: header bar + one label per row
+    grab = {}
+    def start(e): grab["dx"], grab["dy"] = e.x_root - root.winfo_x(), e.y_root - root.winfo_y()
+    def move(e): root.geometry(f"+{e.x_root - grab['dx']}+{e.y_root - grab['dy']}")
 
     def paste():
         try: text = root.clipboard_get()
@@ -449,18 +559,45 @@ def run_overlay(a, fol, db, names, state, arena):
     for txt, cmd in (("x", root.destroy), ("paste", paste)):
         b = tk.Label(bar, text=txt, fg=DIM, bg=BG, font=fnt, cursor="hand2"); b.pack(side="right", padx=4)
         b.bind("<Button-1>", lambda e, c=cmd: c())
-    body = tk.Label(root, text="", justify="left", anchor="nw", fg=FG, bg=BG, font=fnt, padx=6, pady=4)
-    body.pack(fill="both")
-
-    grab = {}
-    def start(e): grab["dx"], grab["dy"] = e.x_root - root.winfo_x(), e.y_root - root.winfo_y()
-    def move(e): root.geometry(f"+{e.x_root - grab['dx']}+{e.y_root - grab['dy']}")
-    for w in (bar, title, body):
+    box = tk.Frame(root, bg=BG); box.pack(fill="both")
+    for w in (bar, title, box):
         w.bind("<ButtonPress-1>", start); w.bind("<B1-Motion>", move)
+
+    def make_row():
+        lab = tk.Label(box, text="", justify="left", anchor="w", fg=FG, bg=BG, font=fnt, padx=5, pady=0)
+        lab.cid = None
+        lab.bind("<Enter>", lambda e, r=lab: enter(r)); lab.bind("<Leave>", lambda e, r=lab: leave(r))
+        lab.bind("<ButtonPress-1>", start); lab.bind("<B1-Motion>", move)
+        return lab
+
+    def set_lines(lines):
+        while len(pool) < len(lines): pool.append(make_row())
+        for lab, (text, cid) in zip(pool, lines):
+            if lab.cget("text") != text: lab.config(text=text)
+            lab.cid = cid
+        if len(lines) != shown[0]:
+            for i, lab in enumerate(pool):
+                if i < len(lines): lab.pack(fill="x")
+                else: lab.pack_forget()
+            shown[0] = len(lines)
+
+    def refresh():
+        deck, src, learned = choose_deck(fol.g, state, arena, fol.path)
+        s = summary(fol.g, names, db, deck, learned)
+        if s["changed"]: save_learned(state["learned"])
+        lines = overlay_lines(s, deck, src, state["err"], a.opp)
+        if fol.msg: lines += [("", None)] + [(t, None) for t in textwrap.wrap(fol.msg.replace("\n", " "), 24)]
+        set_lines(lines)
+        if images:
+            for r in s["rows"]:
+                if r[3]: images.want(r[3])                     # fetch deck pictures ahead of hovering
+        row = hover["row"]
+        if row is not None and row.cid != hover["cid"]: show_card(row)
 
     def tick():
         if fol.poll(): refresh()
         root.lift()                        # stay above the game window
+        if hover["cid"]: popup.lift()
         root.after(500, tick)
 
     refresh(); tick()
@@ -477,8 +614,10 @@ def main():
     ap.add_argument("-o", "--overlay", action="store_true", help="show the always-on-top overlay window")
     ap.add_argument("--pos", default="+20+120", help="overlay position, e.g. +20+120 (drag the header to move)")
     ap.add_argument("--alpha", type=float, default=0.88, help="overlay opacity 0.2-1.0")
-    ap.add_argument("--size", type=int, default=11, help="overlay font size")
+    ap.add_argument("--size", type=int, default=10, help="overlay font size")
     ap.add_argument("--opp", action="store_true", help="also list opponent's played cards in the overlay")
+    ap.add_argument("--no-images", action="store_true", help="don't show card pictures on hover")
+    ap.add_argument("--img-url", default=IMG_URL, help="card picture URL template with {id}")
     ap.add_argument("--once", action="store_true", help="terminal mode: parse once, print, exit")
     ap.add_argument("--setup", action="store_true", help="make Hearthstone write Power.log, then exit")
     a = ap.parse_args()
