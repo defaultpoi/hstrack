@@ -45,6 +45,15 @@ In Hearthstone copy your deck, then click **paste** in the overlay header. The d
 is remembered in `~/.cache/hstrack/last_deck.txt`. You can also use
 `--deck deck.txt` (lines like `2 Fireball`) or `--deck <deck code>`.
 
+### Health and Herald
+
+Under the header the overlay shows your hero's health: `hp 18/29 +3` is current
+health / **max health**, plus armor. Max health is read from the game log, so it
+follows anything that raises or lowers it during the game. Once you have drawn a
+Herald card (or Heralded), `herald 6` shows how many times you have Heralded this
+game. It counts the game's own Herald counter for your player, which matched the
+Herald effects in every game of the real logs I tested.
+
 ### Card pictures
 
 Hover a card in the list to see its picture in a second window beside the overlay
@@ -52,7 +61,10 @@ Hover a card in the list to see its picture in a second window beside the overla
 cards work the same way. Pictures come from HearthstoneJSON
 (`art.hearthstonejson.com`), are downloaded in the background as soon as your deck
 is known, and are cached in `~/.cache/hstrack/img`, so hovering is instant and the
-first download is the only one. If a card has no picture the popup says so.
+first download is the only one. The picture window is cut to the card's shape, so
+its transparent corners are really transparent (X11 Shape extension via
+libX11/libXext, no compositor needed; without them you get a plain rectangle).
+If a card has no picture the popup says so.
 Card art is Blizzard's; this is for personal use. Disable with `--no-images`.
 
 ## Options
@@ -74,5 +86,5 @@ window narrow; the hover picture shows the full card.
 - Card names/costs come from HearthstoneJSON, downloaded once to
   `~/.cache/hstrack/cards2.json` (delete it to refresh after an expansion).
 - Tested against real Underground Arena and ranked logs, and on a virtual X
-  server (layout, hover popup with a local image server). The clipboard paste and
+  server (layout, hover popup with a local image server, window shape). The clipboard paste and
   the live picture download are not yet verified against a real game under Wine.

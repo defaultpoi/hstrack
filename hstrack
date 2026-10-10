@@ -11,6 +11,7 @@ LEARN_CACHE = os.path.join(CACHE_DIR, "learned.json")
 IMG_DIR = os.path.join(CACHE_DIR, "img")
 IMG_URL = "https://art.hearthstonejson.com/v1/render/latest/enUS/256x/{id}.png"
 NAME_W = 17
+KEEP_TAGS = {"HEALTH", "DAMAGE", "ARMOR", "HERALD", "HERO_ENTITY", "HERALD_COLOSSAL_AMOUNT"}
 LOG_CONFIG = """[Power]
 LogLevel=1
 FilePrinting=true
@@ -25,6 +26,7 @@ FULL = re.compile(r"FULL_ENTITY - Creating ID=(\d+) CardID=(\w*)")
 SHOW = re.compile(r"(?:SHOW|CHANGE)_ENTITY - Updating Entity=(.+) CardID=(\w*)$")
 CHANGE = re.compile(r"(?:TAG_CHANGE|HIDE_ENTITY -) Entity=(.+) tag=(\w+) value=(\w+)$")
 TAG = re.compile(r"tag=(\w+) value=(\w+)$")
+PLAYER_ENT = re.compile(r"Player EntityID=(\d+) PlayerID=(\d+)")
 GTYPE = re.compile(r"GameType=(\w+)")
 PLAYER = re.compile(r"PlayerID=(\d+), PlayerName=(.*)$")
 
@@ -41,11 +43,16 @@ class Game:
     def reset(self):
         self.ents, self.me, self.turn, self.cur = {}, None, 0, None
         self.mode, self.players = "", {}
+        self.pe, self.pmap = {}, {}        # player pseudo-entities by player id, entity id -> player id
 
     def ent(self, eid):
         return self.ents.setdefault(eid, dict(card="", name="", zone=None, ctrl=None,
                                               left_deck=False, played=False,
-                                              init=self.turn == 0))
+                                              init=self.turn == 0, t={}))
+
+    def pent(self, pid):
+        return self.pe.setdefault(pid, dict(card="", name="", zone=None, ctrl=pid, left_deck=False,
+                                            played=False, init=False, t={}))
 
     def ref(self, text):
         m = BRACKET.search(text)
@@ -56,17 +63,34 @@ class Game:
             if m[4] and not e["card"]: e["card"] = m[4]
             if not m[1].startswith("UNKNOWN"): e["name"] = m[1]
             return e
-        return self.ent(int(text)) if text.isdigit() else None
+        if text.isdigit():
+            n = int(text)
+            return self.pent(self.pmap[n]) if n in self.pmap else self.ent(n)
+        for pid, nm in self.players.items():
+            if nm and text == nm: return self.pent(pid)
+        return None
 
     def tag(self, e, tag, val):
         if tag == "CONTROLLER" and val.isdigit():
             e["ctrl"] = int(val)
+        elif tag in KEEP_TAGS:
+            e["t"][tag] = int(val) if val.lstrip("-").isdigit() else val
         elif tag == "ZONE":
             old, e["zone"] = e["zone"], val
             if val == "DECK": e["left_deck"] = False
             elif old == "DECK": e["left_deck"] = True
             if old in ("HAND", "DECK") and val in ("PLAY", "SECRET", "GRAVEYARD"):
                 e["played"] = True
+
+    def stats(self, pid):
+        """Your hero's health, max health, armor, and how many times you have Heralded this game."""
+        pe = self.pe.get(pid)
+        hero = self.ents.get(pe["t"].get("HERO_ENTITY")) if pe else None
+        if not hero or "HEALTH" not in hero["t"]: return None
+        mx, dmg = hero["t"]["HEALTH"], hero["t"].get("DAMAGE", 0)
+        return dict(hp=mx - dmg, max_hp=mx, armor=hero["t"].get("ARMOR", 0),
+                    herald=pe["t"].get("HERALD_COLOSSAL_AMOUNT", 0),
+                    herald_cards=any(e["t"].get("HERALD") and e["ctrl"] == pid for e in self.ents.values()))
 
     def feed(self, line):
         """Process one log line; True if the tracked state may have changed."""
@@ -87,7 +111,12 @@ class Game:
         s = m[1].strip()
         if s == "CREATE_GAME":
             self.reset(); return True
-        if s.startswith(("GameEntity", "Player ")):
+        if s.startswith("Player "):
+            m = PLAYER_ENT.match(s)
+            if m:
+                self.pmap[int(m[1])] = int(m[2]); self.cur = self.pent(int(m[2]))
+            return False
+        if s.startswith("GameEntity"):
             self.cur = None; return False
         if (m := FULL.match(s)):
             e = self.ent(int(m[1])); e["card"] = m[2]; self.cur = e
@@ -367,6 +396,94 @@ class Images:
                 self.state[cid] = ("fail", time.time())
 
 
+class Shaper:
+    """Cuts a window down to the opaque pixels of its picture (X11 SHAPE extension), so the PNG's transparent
+    corners really are transparent - no compositor needed. Quietly does nothing if Xlib/Xext can't be loaded."""
+    SPANS = """
+    proc hs_spans {img w h} {
+        set out {}
+        for {set y 0} {$y < $h} {incr y} {
+            set x 0
+            while {$x < $w} {
+                while {$x < $w && [$img transparency get $x $y]} {incr x}
+                if {$x >= $w} break
+                set s $x
+                while {$x < $w && ![$img transparency get $x $y]} {incr x}
+                lappend out $s $y [expr {$x - $s}]
+            }
+        }
+        return $out
+    }
+    """
+
+    def __init__(self, root):
+        self.root, self.cache, self.ok = root, {}, False
+        try:
+            import ctypes, ctypes.util
+            c = self.c = ctypes
+            self.x11 = c.CDLL(c.util.find_library("X11") or "libX11.so.6")
+            self.xext = c.CDLL(c.util.find_library("Xext") or "libXext.so.6")
+
+            class XRect(c.Structure):
+                _fields_ = [("x", c.c_short), ("y", c.c_short), ("width", c.c_ushort), ("height", c.c_ushort)]
+            self.XRect = XRect
+            self.x11.XOpenDisplay.restype = c.c_void_p
+            self.x11.XOpenDisplay.argtypes = [c.c_char_p]
+            self.x11.XSync.argtypes = [c.c_void_p, c.c_int]
+            self.x11.XQueryTree.argtypes = [c.c_void_p, c.c_ulong, c.POINTER(c.c_ulong), c.POINTER(c.c_ulong),
+                                            c.POINTER(c.POINTER(c.c_ulong)), c.POINTER(c.c_uint)]
+            self.x11.XFree.argtypes = [c.c_void_p]
+            self.xext.XShapeCombineRectangles.argtypes = [c.c_void_p, c.c_ulong, c.c_int, c.c_int, c.c_int,
+                                                          c.c_void_p, c.c_int, c.c_int, c.c_int]
+            self.xext.XShapeCombineMask.argtypes = [c.c_void_p, c.c_ulong, c.c_int, c.c_int, c.c_int, c.c_ulong, c.c_int]
+            disp = os.environ.get("DISPLAY")
+            self.dpy = self.x11.XOpenDisplay(disp.encode() if disp else None)
+            if self.dpy:
+                root.tk.eval(self.SPANS)
+                self.ok = True
+        except Exception:
+            self.ok = False
+
+    def top(self, win):
+        """Tk wraps every toplevel in another X window; that outer window (just below the X root) is the one to shape."""
+        c = self.c
+        while True:
+            root, parent, kids, n = c.c_ulong(), c.c_ulong(), c.POINTER(c.c_ulong)(), c.c_uint()
+            self.x11.XQueryTree(self.dpy, win, c.byref(root), c.byref(parent), c.byref(kids), c.byref(n))
+            if kids: self.x11.XFree(kids)
+            if parent.value in (0, root.value): return win
+            win = parent.value
+
+    def cut(self, win, ph, key):
+        """Show only the non-transparent pixels of PhotoImage `ph` in X window `win`."""
+        if not self.ok: return
+        try:
+            if key not in self.cache:
+                flat = self.root.tk.splitlist(self.root.tk.call("hs_spans", ph.name, ph.width(), ph.height()))
+                n = len(flat) // 3
+                arr = (self.XRect * n)()
+                for i in range(n):
+                    arr[i].x, arr[i].y, arr[i].width, arr[i].height = int(flat[3 * i]), int(flat[3 * i + 1]), int(flat[3 * i + 2]), 1
+                self.cache[key] = (arr, n)
+            arr, n = self.cache[key]
+            win = self.top(win)
+            for kind in (0, 1):                      # bounding (the window) and clip (so child widgets are cut too)
+                self.xext.XShapeCombineRectangles(self.dpy, win, kind, 0, 0, arr, n, 0, 0)   # offset 0,0, set, unsorted
+            self.x11.XSync(self.dpy, 0)
+        except Exception:
+            self.ok = False
+
+    def clear(self, win):
+        if not self.ok: return
+        try:
+            win = self.top(win)
+            for kind in (0, 1):                                                        # back to a plain rectangle
+                self.xext.XShapeCombineMask(self.dpy, win, kind, 0, 0, 0, 0)
+            self.x11.XSync(self.dpy, 0)
+        except Exception:
+            self.ok = False
+
+
 # ---------------------------------------------------------------- views
 def label(e, names):
     return names.get(e["card"]) or e["name"] or e["card"] or "?"
@@ -421,7 +538,7 @@ def summary(g, names, db, deck, learned):
     for e in opp:
         if e["played"] and e["card"]:
             p = played.setdefault(label(e, names), [0, e["card"]]); p[0] += 1
-    return dict(turn=g.turn, me=me, mode=g.mode, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
+    return dict(turn=g.turn, me=me, mode=g.mode, stats=g.stats(me) if me else None, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
                 total=total, size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
                 drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
@@ -437,8 +554,17 @@ def fmt_rows(s):
     return [f"{'-' if c is None else c:>2} {short(nm):<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n, cid in s["rows"]]
 
 
+def stats_line(s):
+    st = s["stats"]
+    if not st: return None
+    out = f"hp {max(st['hp'], 0)}/{st['max_hp']}" + (f" +{st['armor']}" if st["armor"] else "")
+    if st["herald"] or st["herald_cards"]: out += f"  herald {st['herald']}"
+    return out
+
+
 def text_view(s, deck, src):
     out = [f"turn {s['turn']}   you = player {s['me'] or '?'}   {s['mode'] or 'no game yet'}",
+           stats_line(s) or "hp ?",
            f"you: deck {s['deck_n']} hand {s['hand_n']}    opp: deck {s['opp_deck']} hand {s['opp_hand']}",
            "", "HAND: " + (", ".join(s["hand"]) or "-"), ""]
     if deck:
@@ -452,12 +578,13 @@ def text_view(s, deck, src):
 
 def overlay_lines(s, deck, src, err, show_opp):
     """[(text, card id or None)] - one overlay row each; rows with a card id show its picture on hover."""
+    info = [(stats_line(s), None)] if stats_line(s) else []
     if not deck:
         if src.startswith("arena"):
-            return [(t, None) for t in ("arena deck not found", "yet. It appears in", "Arena.log once you are", "on the Arena screen.")]
-        return [(t, None) for t in textwrap.wrap(err, 24) + ([""] if err else [])
-                + ["no deck loaded.", "Copy it in Hearthstone,", "then click 'paste'."]]
-    out = [(f"{s['total']} left  t{s['turn']}  {src}", None)]
+            return info + [(t, None) for t in ("arena deck not found", "yet. It appears in", "Arena.log once you are", "on the Arena screen.")]
+        return info + [(t, None) for t in textwrap.wrap(err, 24) + ([""] if err else [])
+                       + ["no deck loaded.", "Copy it in Hearthstone,", "then click 'paste'."]]
+    out = [(f"{s['total']} left  t{s['turn']}  {src}", None)] + info
     out += [(txt, r[3]) for txt, r in zip(fmt_rows(s), s["rows"])]
     if err: out += [("", None)] + [(t, None) for t in textwrap.wrap(err, 24)]
     if show_opp:
@@ -493,8 +620,9 @@ def run_overlay(a, fol, db, names, state, arena):
     popup.attributes("-topmost", True)
     popup.configure(bg=BG)
     popup.withdraw()
-    pic = tk.Label(popup, bg=BG, fg=FG, font=fnt, padx=6, pady=4)
+    pic = tk.Label(popup, bg=BG, fg=FG, font=fnt, bd=0, highlightthickness=0, padx=0, pady=0)
     pic.pack()
+    shaper = Shaper(root) if images else None
 
     def hide_card():
         hover["cid"] = None
@@ -507,8 +635,8 @@ def run_overlay(a, fol, db, names, state, arena):
         if path:
             try: ph = photos.get(cid) or photos.setdefault(cid, tk.PhotoImage(file=path))
             except tk.TclError: images.discard(cid)
-        if ph: pic.config(image=ph, text="")
-        else: pic.config(image="", text=f"no picture for {cid}" if images.failed(cid) else "loading picture...")
+        if ph: pic.config(image=ph, text="", padx=0, pady=0)
+        else: pic.config(image="", text=f"no picture for {cid}" if images.failed(cid) else "loading picture...", padx=8, pady=4)
         popup.update_idletasks()
         w, h = popup.winfo_reqwidth(), popup.winfo_reqheight()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -517,6 +645,9 @@ def run_overlay(a, fol, db, names, state, arena):
         y = max(0, min(row.winfo_rooty() + row.winfo_height() // 2 - h // 2, sh - h))
         popup.geometry(f"+{x}+{y}")
         popup.deiconify(); popup.lift()
+        if shaper:                                              # transparent corners: cut the window to the picture
+            if ph: shaper.cut(popup.winfo_id(), ph, cid)
+            else: shaper.clear(popup.winfo_id())
         if not ph and not images.failed(cid): root.after(200, poll, row, cid)   # still downloading
 
     def poll(row, cid):
