@@ -29,8 +29,11 @@ prefix (default prefix: `~/Games/battlenet`, or set `HS_PREFIX`).
 ### Arena
 
 Nothing to do. When a game starts, the overlay recognises the game type from
-`Power.log` and builds your deck from the `Arena.log` in the same session folder
-(or the newest older session that has one). The header shows `arena`.
+`Power.log` and builds your deck from the `Arena.log` files. A run can span several
+Hearthstone sessions (one `Logs/Hearthstone_<timestamp>` folder per launch), so the
+`Arena.log` of the current session and of earlier ones are replayed as one
+continuous log, back to the session where the draft began (up to 30 sessions
+back). The header shows `arena`.
 
 `Arena.log` lists each distinct card once, so copy counts start from your draft
 picks and are corrected as copies appear in games (remembered in

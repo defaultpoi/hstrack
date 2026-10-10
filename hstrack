@@ -297,8 +297,10 @@ def save_learned(data):
 
 
 # ---------------------------------------------------------------- arena deck (from Arena.log)
-def read_arena(path):
-    """Replay Arena.log -> (card ids in the deck, Counter of draft picks, uncertain?) or None.
+def read_arena(paths):
+    """Replay Arena.log files (oldest session first) -> (card ids in the deck, Counter of draft picks, uncertain?) or None.
+    A run can span several Hearthstone sessions: the picks live in the session where you drafted, the later
+    sessions only log deck listings, so the files are replayed as one continuous log.
 
     Underground Arena: after a loss you redraft - pick 5 cards, then toss 5. The log shows the deck before the
     redraft; the new deck only appears when the deck screen is next opened (and that listing ends with the 5
@@ -315,26 +317,27 @@ def read_arena(path):
             state = None
         deck_lines = lines
 
-    try: f = open(path, encoding="utf-8", errors="replace")
-    except OSError: return None
-    with f:
-        for ln in f:
-            if "Draft deck contains card" in ln:
-                m = re.search(r"contains card (\w+)", ln)
-                if m and cur is not None: cur.append(m[1])
-                continue
-            flush()
-            if "Draft Deck ID" in ln: cur = []
-            elif "DraftManager.OnBegin" in ln: picks, redraft, state, deck_lines = [], [], None, None
-            elif "OnRedraftBegin" in ln: redraft, state = [], "begun"
-            elif "Client chooses:" in ln:
-                m = re.search(r"\((\w+)\)\s*$", ln.strip())
-                if m and not m[1].startswith("HERO_"):
-                    picks.append(m[1])
-                    if state == "begun":
-                        redraft.append(m[1])
-                        if len(redraft) >= 5: state = "picked"
-    flush()
+    for path in paths:
+        try: f = open(path, encoding="utf-8", errors="replace")
+        except OSError: continue
+        with f:
+            for ln in f:
+                if "Draft deck contains card" in ln:
+                    m = re.search(r"contains card (\w+)", ln)
+                    if m and cur is not None: cur.append(m[1])
+                    continue
+                flush()
+                if "Draft Deck ID" in ln: cur = []
+                elif "DraftManager.OnBegin" in ln: picks, redraft, state, deck_lines = [], [], None, None
+                elif "OnRedraftBegin" in ln: redraft, state = [], "begun"
+                elif "Client chooses:" in ln:
+                    m = re.search(r"\((\w+)\)\s*$", ln.strip())
+                    if m and not m[1].startswith("HERO_"):
+                        picks.append(m[1])
+                        if state == "begun":
+                            redraft.append(m[1])
+                            if len(redraft) >= 5: state = "picked"
+        flush()
     if deck_lines is None and not picks: return None
     if deck_lines is None: ids, uncertain = picks, True                       # just drafted: no listing yet
     else: ids, uncertain = deck_lines + (redraft if state else []), state is not None
@@ -342,36 +345,45 @@ def read_arena(path):
 
 
 class ArenaSource:
-    """Arena deck from the Arena.log beside the current Power.log (else the newest older session with one).
+    """Arena deck from the Arena.log files of this and earlier sessions (a run can span several restarts).
     Arena.log lists each distinct card once, so copy counts start from your draft picks and get
     corrected as copies show up in games (see summary())."""
     def __init__(self, db):
-        self.db, self.memo = db, {}
+        self.db, self.begin, self.memo = db, {}, ("", None)
+
+    def starts_draft(self, p, mt):
+        if (p, mt) not in self.begin:
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f: self.begin[(p, mt)] = "DraftManager.OnBegin" in f.read()
+            except OSError: self.begin[(p, mt)] = False
+        return self.begin[(p, mt)]
 
     def get(self, power_log):
         """-> (deck, signature, uncertain) or None"""
         if not power_log: return None
         d = os.path.dirname(power_log)
         older = sorted((p for p in glob.glob(os.path.join(os.path.dirname(d), "Hearthstone_*")) if p < d), reverse=True)
-        for folder in [d] + older[:8]:
+        chain = []
+        for folder in [d] + older[:30]:               # newest first, back to the session where the draft began
             p = os.path.join(folder, "Arena.log")
             try: mt = os.path.getmtime(p)
             except OSError: continue
-            if self.memo.get(p, (None,))[0] != mt: self.memo[p] = (mt, read_arena(p))
-            got = self.memo[p][1]
-            if got:
-                ids, picks, uncertain = got
-                deck = {}
-                for cid in ids:
-                    rec = self.db.get(cid)
-                    name = rec[0] if rec else cid
-                    e = deck.setdefault(norm(name), entry(name, 0, rec[1] if rec else None))
-                    e["n"] += max(picks.get(cid, 0), 1)
-                    e["ids"].add(cid)
-                    e["unc"] = uncertain
-                sig = hashlib.md5((",".join(sorted(ids)) + ("?" if uncertain else "")).encode()).hexdigest()[:12]
-                return deck, sig, uncertain
-        return None
+            chain.append((p, mt))
+            if self.starts_draft(p, mt): break
+        if self.memo[0] != chain: self.memo = (chain, read_arena([p for p, _ in reversed(chain)]))
+        got = self.memo[1]
+        if not got: return None
+        ids, picks, uncertain = got
+        deck = {}
+        for cid in ids:
+            rec = self.db.get(cid)
+            name = rec[0] if rec else cid
+            e = deck.setdefault(norm(name), entry(name, 0, rec[1] if rec else None))
+            e["n"] += max(picks.get(cid, 0), 1)
+            e["ids"].add(cid)
+            e["unc"] = uncertain
+        sig = hashlib.md5((",".join(sorted(ids)) + ("?" if uncertain else "")).encode()).hexdigest()[:12]
+        return deck, sig, uncertain
 
 
 def choose_deck(g, state, arena, path):
