@@ -30,14 +30,22 @@ prefix (default prefix: `~/Games/battlenet`, or set `HS_PREFIX`).
 
 Nothing to do. When a game starts, the overlay recognises the game type from
 `Power.log` and builds your deck from the `Arena.log` in the same session folder
-(or the newest older session that has one). The overlay shows `[arena]` in its
-header. Arena.log is written when you are back on the Arena screen, so the deck is
-not available for the very first game right after drafting.
+(or the newest older session that has one). The header shows `arena`.
 
 `Arena.log` lists each distinct card once, so copy counts start from your draft
 picks and are corrected as copies appear in games (remembered in
 `~/.cache/hstrack/learned.json`). The total always matches the real deck size.
-Cards shuffled into your deck during a game are added to the list.
+Cards shuffled into your deck during a game are added to the list, and so is any
+card you draw that the list lacks.
+
+**Redrafts.** After a loss you pick 5 cards and then toss 5. `Arena.log` records the
+deck before the redraft and your 5 picks, but never the toss; the new deck only
+appears (with the 5 picks repeated at the end, which hstrack ignores) when you next
+open the deck screen. So the first game after a redraft, and the first game right
+after drafting, is shown as `arena~`: the list is the previous deck plus the new
+picks, so it can still contain cards you tossed, and the percentages are relative
+among the listed cards. As soon as the new deck is logged the header goes back to
+`arena` and the list is exact.
 
 ### Constructed
 

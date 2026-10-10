@@ -298,21 +298,47 @@ def save_learned(data):
 
 # ---------------------------------------------------------------- arena deck (from Arena.log)
 def read_arena(path):
-    """-> (card ids of the latest draft-deck listing, Counter of draft picks since the draft began)."""
-    ids, picks = [], Counter()
+    """Replay Arena.log -> (card ids in the deck, Counter of draft picks, uncertain?) or None.
+
+    Underground Arena: after a loss you redraft - pick 5 cards, then toss 5. The log shows the deck before the
+    redraft; the new deck only appears when the deck screen is next opened (and that listing ends with the 5
+    redraft picks again, tossed ones included). The toss itself is never logged, so until that listing appears
+    the deck is only known as 'old deck + the 5 picks' (uncertain)."""
+    picks, redraft, state, deck_lines, cur = [], [], None, None, None
+
+    def flush():
+        nonlocal cur, deck_lines, state
+        if cur is None: return
+        lines, cur = list(cur), None
+        if state == "picked":                       # listing after the toss = the new deck
+            if len(redraft) == 5 and lines[-5:] == redraft: lines = lines[:-5]
+            state = None
+        deck_lines = lines
+
     try: f = open(path, encoding="utf-8", errors="replace")
-    except OSError: return ids, picks
+    except OSError: return None
     with f:
         for ln in f:
-            if "Draft Deck ID" in ln: ids = []
-            elif "Draft deck contains card" in ln:
+            if "Draft deck contains card" in ln:
                 m = re.search(r"contains card (\w+)", ln)
-                if m and m[1] not in ids: ids.append(m[1])
-            elif "DraftManager.OnBegin" in ln: picks = Counter()
+                if m and cur is not None: cur.append(m[1])
+                continue
+            flush()
+            if "Draft Deck ID" in ln: cur = []
+            elif "DraftManager.OnBegin" in ln: picks, redraft, state, deck_lines = [], [], None, None
+            elif "OnRedraftBegin" in ln: redraft, state = [], "begun"
             elif "Client chooses:" in ln:
                 m = re.search(r"\((\w+)\)\s*$", ln.strip())
-                if m: picks[m[1]] += 1
-    return ids, picks
+                if m and not m[1].startswith("HERO_"):
+                    picks.append(m[1])
+                    if state == "begun":
+                        redraft.append(m[1])
+                        if len(redraft) >= 5: state = "picked"
+    flush()
+    if deck_lines is None and not picks: return None
+    if deck_lines is None: ids, uncertain = picks, True                       # just drafted: no listing yet
+    else: ids, uncertain = deck_lines + (redraft if state else []), state is not None
+    return list(dict.fromkeys(ids)), Counter(picks), uncertain
 
 
 class ArenaSource:
@@ -323,6 +349,7 @@ class ArenaSource:
         self.db, self.memo = db, {}
 
     def get(self, power_log):
+        """-> (deck, signature, uncertain) or None"""
         if not power_log: return None
         d = os.path.dirname(power_log)
         older = sorted((p for p in glob.glob(os.path.join(os.path.dirname(d), "Hearthstone_*")) if p < d), reverse=True)
@@ -331,8 +358,9 @@ class ArenaSource:
             try: mt = os.path.getmtime(p)
             except OSError: continue
             if self.memo.get(p, (None,))[0] != mt: self.memo[p] = (mt, read_arena(p))
-            ids, picks = self.memo[p][1]
-            if ids:
+            got = self.memo[p][1]
+            if got:
+                ids, picks, uncertain = got
                 deck = {}
                 for cid in ids:
                     rec = self.db.get(cid)
@@ -340,7 +368,9 @@ class ArenaSource:
                     e = deck.setdefault(norm(name), entry(name, 0, rec[1] if rec else None))
                     e["n"] += max(picks.get(cid, 0), 1)
                     e["ids"].add(cid)
-                return deck, hashlib.md5(",".join(sorted(ids)).encode()).hexdigest()[:12]
+                    e["unc"] = uncertain
+                sig = hashlib.md5((",".join(sorted(ids)) + ("?" if uncertain else "")).encode()).hexdigest()[:12]
+                return deck, sig, uncertain
         return None
 
 
@@ -348,7 +378,7 @@ def choose_deck(g, state, arena, path):
     """Arena games use the deck from Arena.log; everything else uses the deck you pasted."""
     if "ARENA" in g.mode.upper():
         got = arena.get(path)
-        if got: return got[0], "arena", state["learned"].setdefault(got[1], {})
+        if got: return got[0], "arena~" if got[2] else "arena", state["learned"].setdefault(got[1], {})
         return {}, "arena (no deck yet)", {}
     return state["deck"], "pasted", {}
 
@@ -504,6 +534,15 @@ def summary(g, names, db, deck, learned):
             k = nk if nk in deck else None
         return k
 
+    if deck:                                        # cards you have drawn that the list lacks (stale/approximate list) are
+        extra = Counter(e["card"] for e in mine if e["init"] and e["left_deck"] and e["card"] and key_of(e) is None)
+        if extra:                                   # certainly in your deck, so they join it
+            deck = dict(deck)
+            for cid, n in extra.items():
+                nm = names.get(cid) or cid
+                deck["+" + norm(nm)] = entry(nm, n, (db.get(cid) or [0, None])[1], [cid], exact=True)
+            by_id = {cid: k for k, d in deck.items() for cid in d["ids"]}
+
     # copies of each listed card that have left your starting deck so far
     drawn, changed = Counter(), False
     for e in mine:
@@ -516,6 +555,7 @@ def summary(g, names, db, deck, learned):
     start_n = sum(1 for e in mine if e["init"] and (e["zone"] == "DECK" or e["left_deck"]))
     est = {k: max(d["n"], learned.get(k, 0)) for k, d in deck.items()}
     over = sum(est.values()) - start_n if start_n else 0
+    if any(d.get("unc") for d in deck.values()): over = 0     # redraft toss not logged yet: don't guess which copies went
     while over > 0:
         spare = [k for k, d in deck.items() if not d["exact"] and est[k] > max(1, learned.get(k, 0))]
         if not spare: break
@@ -539,7 +579,7 @@ def summary(g, names, db, deck, learned):
         if e["played"] and e["card"]:
             p = played.setdefault(label(e, names), [0, e["card"]]); p[0] += 1
     return dict(turn=g.turn, me=me, mode=g.mode, stats=g.stats(me) if me else None, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
-                total=total, size=total or 1, rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
+                total=total, size=max(sum(r[2] for r in rows), 1), rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
                 drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
                 opp=sorted((nm, p[0], p[1]) for nm, p in played.items()))
