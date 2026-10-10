@@ -304,7 +304,7 @@ def read_arena(paths):
 
     Underground Arena: after a loss you redraft - pick 5 cards, then toss 5. The log shows the deck before the
     redraft; the new deck only appears when the deck screen is next opened (and that listing ends with the 5
-    redraft picks again, tossed ones included). The toss itself is never logged, so until that listing appears
+    redraft picks again, duplicates removed, tossed ones included). The toss itself is never logged, so until that listing appears
     the deck is only known as 'old deck + the 5 picks' (uncertain)."""
     picks, redraft, state, deck_lines, cur = [], [], None, None, None
 
@@ -312,9 +312,10 @@ def read_arena(paths):
         nonlocal cur, deck_lines, state
         if cur is None: return
         lines, cur = list(cur), None
-        if state == "picked":                       # listing after the toss = the new deck
-            if len(redraft) == 5 and lines[-5:] == redraft: lines = lines[:-5]
-            state = None
+        for tail in (redraft, list(dict.fromkeys(redraft))):     # after a redraft every listing ends with that redraft's
+            if tail and len(tail) < len(lines) and lines[-len(tail):] == tail:   # picks again (duplicates removed): not deck
+                lines = lines[:-len(tail)]; break
+        if state == "picked": state = None                       # a listing after the toss = the new deck
         deck_lines = lines
 
     for path in paths:

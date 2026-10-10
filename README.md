@@ -33,7 +33,7 @@ Nothing to do. When a game starts, the overlay recognises the game type from
 Hearthstone sessions (one `Logs/Hearthstone_<timestamp>` folder per launch), so the
 `Arena.log` of the current session and of earlier ones are replayed as one
 continuous log, back to the session where the draft began (up to 30 sessions
-back). The header shows `arena`.
+back; verified with real logs of a run restarted mid-way). The header shows `arena`.
 
 `Arena.log` lists each distinct card once, so copy counts start from your draft
 picks and are corrected as copies appear in games (remembered in
@@ -43,8 +43,9 @@ card you draw that the list lacks.
 
 **Redrafts.** After a loss you pick 5 cards and then toss 5. `Arena.log` records the
 deck before the redraft and your 5 picks, but never the toss; the new deck only
-appears (with the 5 picks repeated at the end, which hstrack ignores) when you next
-open the deck screen. So the first game after a redraft, and the first game right
+appears when you next open the deck screen. Every listing after a redraft also ends
+with that redraft's picks again (duplicates removed, tossed ones included, and it
+repeats in every listing until the next redraft); hstrack ignores that tail. So the first game after a redraft, and the first game right
 after drafting, is shown as `arena~`: the list is the previous deck plus the new
 picks, so it can still contain cards you tossed, and the percentages are relative
 among the listed cards. As soon as the new deck is logged the header goes back to
