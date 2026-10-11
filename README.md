@@ -67,15 +67,28 @@ Herald card (or Heralded), `herald 6` shows how many times you have Heralded thi
 game. It counts the game's own Herald counter for your player, which matched the
 Herald effects in every game of the real logs I tested.
 
-### Opponent panel
+### Two sections per panel
 
-The left panel follows your opponent: hand and deck sizes, their hero's health
-(`hp 28/30`, plus armor and `herald N` once they use Herald, read the same way as
-yours) and every card they have played or revealed this game, sorted by mana cost.
-Their deck list is not in the log, so this is what has been seen, not what is left.
-Both panels are the same width (the height follows the content), drag either by its
-header, and the `x` in a header closes just that panel (the app exits when both are
-closed). `--no-opp` shows only your panel.
+Each panel is split in two: the **top section is the deck**, the **bottom section is
+the cards played**.
+
+- **Your panel (right):** a status line (turn, `arena`/`pasted`), your hero's health,
+  then `-- deck (N) --` with the cards left (mana cost, count, draw chance), then
+  `-- played (N) --` with every card you have played this game, grouped by name and
+  sorted by mana cost.
+- **Opponent panel (left, same width):** hand and deck sizes and their hero's health
+  (`hp 28/30`, plus armor and `herald N` once they use Herald), then
+  `-- in hand/deck (N) --` and `-- played (N) --`. The log never shows the contents of
+  their deck, so the top section lists only the cards known to be in their hand or
+  deck (cards shuffled in or returned to hand) and counts the rest as `(unknown)`.
+
+"Played" means played from hand: discarded or burned cards, summoned tokens and
+cards put into play by other effects are not counted. If a panel would run off the
+bottom of the screen, the played section is cut with a `+N more (no room)` line
+(the deck section is always kept whole). Panels are re-fitted after you drag them.
+Both panels are the same width (the height follows the content), the `x` in a header
+closes just that panel (the app exits when both are closed), and `--no-opp` shows
+only your panel.
 
 ### Card pictures
 

@@ -81,7 +81,7 @@ class Game:
             old, e["zone"] = e["zone"], val
             if val == "DECK": e["left_deck"] = False
             elif old == "DECK": e["left_deck"] = True
-            if old in ("HAND", "DECK") and val in ("PLAY", "SECRET", "GRAVEYARD"):
+            if old == "HAND" and val in ("PLAY", "SECRET"):
                 e["played"] = True
 
     def stats(self, pid):
@@ -589,17 +589,18 @@ def summary(g, names, db, deck, learned):
     if unknown > 0: rows.append((None, "(unknown)", unknown, None))
     rows.sort(key=lambda r: (99 if r[0] is None else r[0], norm(r[1])))
     total = deck_n if me else sum(r[2] for r in rows)
-    played = {}
-    for e in opp:
-        if e["played"] and e["card"]:
-            p = played.setdefault(label(e, names), [0, e["card"], (db.get(e["card"]) or [0, None])[1]]); p[0] += 1
+    def group(es, pred):                            # [(name, copies, card id, cost)] sorted by cost, then name
+        d = {}
+        for e in es:
+            if e["card"] and pred(e):
+                p = d.setdefault(label(e, names), [0, e["card"], (db.get(e["card"]) or [0, None])[1]]); p[0] += 1
+        return sorted(((nm, p[0], p[1], p[2]) for nm, p in d.items()), key=lambda t: (99 if t[3] is None else t[3], norm(t[0])))
     return dict(turn=g.turn, me=me, mode=g.mode, stats=g.stats(me) if me else None, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
                 total=total, size=max(sum(r[2] for r in rows), 1), rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
                 drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
-                ostats=g.stats(3 - me) if me else None,
-                opp=sorted(((nm, p[0], p[1], p[2]) for nm, p in played.items()),
-                           key=lambda t: (99 if t[3] is None else t[3], norm(t[0]))))
+                ostats=g.stats(3 - me) if me else None, played_me=group(mine, lambda e: e["played"]),
+                opp=group(opp, lambda e: e["played"]), opp_known=group(opp, lambda e: e["zone"] in ("HAND", "DECK")))
 
 
 def short(nm):
@@ -631,33 +632,59 @@ def text_view(s, deck, src):
         out += [f"DECK ({s['total']} cards left)  [{src}]"] + ["  " + r for r in fmt_rows(s)]
     else:
         out += [f"DRAWN ({sum(s['drawn'].values())})  [{src}]"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
+    out += ["", f"YOU PLAYED ({sum(p[1] for p in s['played_me'])})"] + [f"  {n}x {nm}" for nm, n, cid, cost in s["played_me"]]
     out += ["", f"OPPONENT PLAYED ({sum(o[1] for o in s['opp'])})"]
     out += [f"  {n}x {nm}" for nm, n, cid, cost in s["opp"]]
     return "\n".join(out)
 
 
-def overlay_lines(s, deck, src, err):
-    """[(text, card id or None)] - one row each for MY panel; rows with a card id show its picture on hover."""
-    info = [(stats_line(s), None)] if stats_line(s) else []
+COLS = 28                                    # characters per row: both panels are this wide
+
+
+def rule(title):
+    return (f"-- {title} ".ljust(COLS, "-"), None, "hdr")
+
+
+def plain_rows(entries):
+    """[(name, copies, card id, cost)] -> rows 'cost name Nx' (with a card id, so hover shows the picture)."""
+    if not entries: return []
+    w = min(NAME_W, max(len(e[0]) for e in entries))
+    return [(f"{'-' if cost is None else cost:>2} {short(nm):<{w}} {n}x", cid) for nm, n, cid, cost in entries]
+
+
+def my_lines(s, deck, src, err):
+    """-> (top, bottom) rows for MY panel: status and the cards left in the deck, then the cards I have played."""
+    top = ([(f"t{s['turn']}  {src}", None)] if deck else []) + ([(stats_line(s), None)] if stats_line(s) else [])
     if not deck:
         if src.startswith("arena"):
-            return info + [(t, None) for t in ("arena deck not found", "yet. It appears in", "Arena.log once you are", "on the Arena screen.")]
-        return info + [(t, None) for t in textwrap.wrap(err, 24) + ([""] if err else [])
-                       + ["no deck loaded.", "Copy it in Hearthstone,", "then click 'paste'."]]
-    out = [(f"{s['total']} left  t{s['turn']}  {src}", None)] + info
-    out += [(txt, r[3]) for txt, r in zip(fmt_rows(s), s["rows"])]
-    if err: out += [("", None)] + [(t, None) for t in textwrap.wrap(err, 24)]
-    return out
+            top += [(t, None) for t in ("arena deck not found", "yet. It appears in", "Arena.log once you are", "on the Arena screen.")]
+        else:
+            top += [(t, None) for t in textwrap.wrap(err, 24) + ([""] if err else []) + ["no deck loaded.", "Copy it in Hearthstone,", "then click 'paste'."]]
+    else:
+        top += [rule(f"deck ({s['total']})")] + [(txt, r[3]) for txt, r in zip(fmt_rows(s), s["rows"])]
+        if err: top += [("", None)] + [(t, None) for t in textwrap.wrap(err, 24)]
+    n = sum(p[1] for p in s["played_me"])
+    return top, ([rule(f"played ({n})")] + plain_rows(s["played_me"]) if n else [])
 
 
 def opp_lines(s):
-    """Rows for the OPPONENT panel: their hand/deck sizes, hero health, and every card they have played."""
-    if not s["me"]: return [("opponent: waiting for", None), ("a game to start", None)]
-    out = [(f"opp  hand {s['opp_hand']}  deck {s['opp_deck']}", None)]
-    if stats_text(s["ostats"]): out.append((stats_text(s["ostats"]), None))
-    if not s["opp"]: return out + [("no cards played yet", None)]
-    w = min(NAME_W, max(len(o[0]) for o in s["opp"]))
-    return out + [(f"{'-' if cost is None else cost:>2} {short(nm):<{w}} {n}x", cid) for nm, n, cid, cost in s["opp"]]
+    """-> (top, bottom) rows for the OPPONENT panel: what is known of their hand/deck, then the cards they have played."""
+    if not s["me"]: return [("opponent: waiting for", None), ("a game to start", None)], []
+    top = [(f"opp  hand {s['opp_hand']}  deck {s['opp_deck']}", None)]
+    if stats_text(s["ostats"]): top.append((stats_text(s["ostats"]), None))
+    pool = s["opp_hand"] + s["opp_deck"]
+    unknown = pool - sum(o[1] for o in s["opp_known"])
+    top += [rule(f"in hand/deck ({pool})")] + plain_rows(s["opp_known"] + ([("(unknown)", unknown, None, None)] if unknown > 0 else []))
+    n = sum(o[1] for o in s["opp"])
+    return top, [rule(f"played ({n})")] + (plain_rows(s["opp"]) if n else [("no cards played yet", None)])
+
+
+def fit(top, bottom, max_rows):
+    """Keep the top section whole; cut the played section (with a '+N more' line) if the panel would not fit the screen."""
+    room = max_rows - len(top)
+    if len(bottom) <= room: return top + bottom
+    if room < 3: return top
+    return top + bottom[:room - 1] + [(f"+{len(bottom) - room + 1} more (no room)", None, "hdr")]
 
 
 def run_overlay(a, fol, db, names, state, arena):
@@ -759,6 +786,7 @@ def run_overlay(a, fol, db, names, state, arena):
         def drag(self, widget):
             widget.bind("<ButtonPress-1>", lambda e: self.grab.update(dx=e.x_root - self.win.winfo_x(), dy=e.y_root - self.win.winfo_y()))
             widget.bind("<B1-Motion>", lambda e: self.win.geometry(f"+{e.x_root - self.grab['dx']}+{e.y_root - self.grab['dy']}"))
+            widget.bind("<ButtonRelease-1>", lambda e: refresh())     # re-fit to the screen from the new position
 
         def close(self):
             hide_card()
@@ -774,8 +802,10 @@ def run_overlay(a, fol, db, names, state, arena):
 
         def set_lines(self, lines):
             while len(self.pool) < len(lines): self.pool.append(self.make_row())
-            for lab, (text, cid) in zip(self.pool, lines):
+            for lab, (text, cid, *kind) in zip(self.pool, lines):
                 if lab.cget("text") != text: lab.config(text=text)
+                fg = DIM if kind else FG
+                if lab.cget("fg") != fg: lab.config(fg=fg)
                 lab.cid = cid
             if len(lines) != self.shown:
                 for i, lab in enumerate(self.pool):
@@ -797,17 +827,25 @@ def run_overlay(a, fol, db, names, state, arena):
     mine = Panel("hstrack", a.pos, paste)                       # your deck, on the right
     theirs = None if a.no_opp else Panel("opponent", a.opp_pos)  # the opponent's cards, on the left
 
+    probe = tk.Label(root, text="x", font=fnt, padx=5, pady=0)
+    row_h = probe.winfo_reqheight()                            # exactly the height of one row
+    probe.destroy()
+
+    def room(panel):                                           # how many rows fit between the panel's top and the screen's bottom
+        panel.win.update_idletasks()                           # so the panel's position is known
+        return max(8, (panel.win.winfo_screenheight() - max(panel.win.winfo_rooty(), 0) - 52) // row_h)
+
     def refresh():
         deck, src, learned = choose_deck(fol.g, state, arena, fol.path)
         s = summary(fol.g, names, db, deck, learned)
         if s["changed"]: save_learned(state["learned"])
         if mine in panels:
-            lines = overlay_lines(s, deck, src, state["err"])
-            if fol.msg: lines += [("", None)] + [(t, None) for t in textwrap.wrap(fol.msg.replace("\n", " "), 24)]
-            mine.set_lines(lines)
-        if theirs is not None and theirs in panels: theirs.set_lines(opp_lines(s))
+            top, bottom = my_lines(s, deck, src, state["err"])
+            if fol.msg: top += [("", None)] + [(t, None) for t in textwrap.wrap(fol.msg.replace("\n", " "), 24)]
+            mine.set_lines(fit(top, bottom, room(mine)))
+        if theirs is not None and theirs in panels: theirs.set_lines(fit(*opp_lines(s), room(theirs)))
         if images:
-            for cid in [r[3] for r in s["rows"]] + [o[2] for o in s["opp"]]:
+            for cid in [r[3] for r in s["rows"]] + [p[2] for p in s["played_me"]] + [o[2] for o in s["opp"]] + [o[2] for o in s["opp_known"]]:
                 if cid: images.want(cid)                       # fetch pictures ahead of hovering
         row = hover["row"]
         if row is not None and row.cid != hover["cid"]: show_card(row)
