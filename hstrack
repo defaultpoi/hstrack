@@ -68,6 +68,8 @@ class Game:
             return self.pent(self.pmap[n]) if n in self.pmap else self.ent(n)
         for pid, nm in self.players.items():
             if nm and text == nm: return self.pent(pid)
+        if self.me and text and text != "GameEntity":          # the only other plain names are the opponent's
+            return self.pent(3 - self.me)
         return None
 
     def tag(self, e, tag, val):
@@ -590,12 +592,14 @@ def summary(g, names, db, deck, learned):
     played = {}
     for e in opp:
         if e["played"] and e["card"]:
-            p = played.setdefault(label(e, names), [0, e["card"]]); p[0] += 1
+            p = played.setdefault(label(e, names), [0, e["card"], (db.get(e["card"]) or [0, None])[1]]); p[0] += 1
     return dict(turn=g.turn, me=me, mode=g.mode, stats=g.stats(me) if me else None, changed=changed, deck_n=deck_n, hand_n=count(mine, "HAND"),
                 total=total, size=max(sum(r[2] for r in rows), 1), rows=rows, opp_deck=count(opp, "DECK"), opp_hand=count(opp, "HAND"),
                 hand=sorted(label(e, names) for e in mine if e["zone"] == "HAND" and e["card"]),
                 drawn=Counter(label(e, names) for e in mine if e["left_deck"] and e["zone"] != "DECK" and e["card"]),
-                opp=sorted((nm, p[0], p[1]) for nm, p in played.items()))
+                ostats=g.stats(3 - me) if me else None,
+                opp=sorted(((nm, p[0], p[1], p[2]) for nm, p in played.items()),
+                           key=lambda t: (99 if t[3] is None else t[3], norm(t[0]))))
 
 
 def short(nm):
@@ -607,30 +611,33 @@ def fmt_rows(s):
     return [f"{'-' if c is None else c:>2} {short(nm):<{w}} {n}x {100 * n // s['size']:>3}%" for c, nm, n, cid in s["rows"]]
 
 
-def stats_line(s):
-    st = s["stats"]
+def stats_text(st):
     if not st: return None
     out = f"hp {max(st['hp'], 0)}/{st['max_hp']}" + (f" +{st['armor']}" if st["armor"] else "")
     if st["herald"] or st["herald_cards"]: out += f"  herald {st['herald']}"
     return out
 
 
+def stats_line(s):
+    return stats_text(s["stats"])
+
+
 def text_view(s, deck, src):
     out = [f"turn {s['turn']}   you = player {s['me'] or '?'}   {s['mode'] or 'no game yet'}",
            stats_line(s) or "hp ?",
-           f"you: deck {s['deck_n']} hand {s['hand_n']}    opp: deck {s['opp_deck']} hand {s['opp_hand']}",
+           f"opp: deck {s['opp_deck']} hand {s['opp_hand']}  " + (stats_text(s["ostats"]) or "hp ?"),
            "", "HAND: " + (", ".join(s["hand"]) or "-"), ""]
     if deck:
         out += [f"DECK ({s['total']} cards left)  [{src}]"] + ["  " + r for r in fmt_rows(s)]
     else:
         out += [f"DRAWN ({sum(s['drawn'].values())})  [{src}]"] + [f"  {n}x {c}" for c, n in sorted(s["drawn"].items())]
-    out += ["", f"OPPONENT PLAYED ({sum(n for _, n, _ in s['opp'])})"]
-    out += [f"  {n}x {nm}" for nm, n, cid in s["opp"]]
+    out += ["", f"OPPONENT PLAYED ({sum(o[1] for o in s['opp'])})"]
+    out += [f"  {n}x {nm}" for nm, n, cid, cost in s["opp"]]
     return "\n".join(out)
 
 
-def overlay_lines(s, deck, src, err, show_opp):
-    """[(text, card id or None)] - one overlay row each; rows with a card id show its picture on hover."""
+def overlay_lines(s, deck, src, err):
+    """[(text, card id or None)] - one row each for MY panel; rows with a card id show its picture on hover."""
     info = [(stats_line(s), None)] if stats_line(s) else []
     if not deck:
         if src.startswith("arena"):
@@ -640,9 +647,17 @@ def overlay_lines(s, deck, src, err, show_opp):
     out = [(f"{s['total']} left  t{s['turn']}  {src}", None)] + info
     out += [(txt, r[3]) for txt, r in zip(fmt_rows(s), s["rows"])]
     if err: out += [("", None)] + [(t, None) for t in textwrap.wrap(err, 24)]
-    if show_opp:
-        out += [("", None), ("opp played:", None)] + [(f" {n}x {short(nm)}", cid) for nm, n, cid in s["opp"]]
     return out
+
+
+def opp_lines(s):
+    """Rows for the OPPONENT panel: their hand/deck sizes, hero health, and every card they have played."""
+    if not s["me"]: return [("opponent: waiting for", None), ("a game to start", None)]
+    out = [(f"opp  hand {s['opp_hand']}  deck {s['opp_deck']}", None)]
+    if stats_text(s["ostats"]): out.append((stats_text(s["ostats"]), None))
+    if not s["opp"]: return out + [("no cards played yet", None)]
+    w = min(NAME_W, max(len(o[0]) for o in s["opp"]))
+    return out + [(f"{'-' if cost is None else cost:>2} {short(nm):<{w}} {n}x", cid) for nm, n, cid, cost in s["opp"]]
 
 
 def run_overlay(a, fol, db, names, state, arena):
@@ -654,20 +669,15 @@ def run_overlay(a, fol, db, names, state, arena):
     BG, HI, FG, DIM = "#0d1117", "#1f2a37", "#e6edf3", "#8b949e"
     try: root = tk.Tk()
     except tk.TclError as ex: sys.exit(f"can't open a window: {ex}")
-    root.title("hstrack")
-    root.overrideredirect(True)            # no title bar; drag the header to move
-    root.attributes("-topmost", True)
-    try: root.attributes("-alpha", a.alpha)   # needs a compositor (xfwm4: Window Manager Tweaks)
-    except tk.TclError: pass
-    root.configure(bg=BG)
-    root.geometry(a.pos)
+    root.withdraw()                          # hidden: it only runs the event loop; the panels are windows of their own
     fnt = tkfont.nametofont("TkFixedFont").copy()
     fnt.configure(size=a.size)
+    col_w = fnt.measure("0" * 28) + 14       # both panels get this width (28 characters + padding)
     images = None if a.no_images else Images(a.img_url)
-    pool, shown, photos = [], [0], {}
+    photos, panels = {}, []
     hover = {"row": None, "cid": None, "hide": None}
 
-    # ---- card picture popup (a second borderless window beside the overlay)
+    # ---- card picture popup, shared by both panels (a borderless window beside the hovered panel)
     popup = tk.Toplevel(root)
     popup.overrideredirect(True)
     popup.attributes("-topmost", True)
@@ -691,10 +701,11 @@ def run_overlay(a, fol, db, names, state, arena):
         if ph: pic.config(image=ph, text="", padx=0, pady=0)
         else: pic.config(image="", text=f"no picture for {cid}" if images.failed(cid) else "loading picture...", padx=8, pady=4)
         popup.update_idletasks()
+        win = row.winfo_toplevel()
         w, h = popup.winfo_reqwidth(), popup.winfo_reqheight()
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        x = root.winfo_rootx() + root.winfo_width() + 6          # right of the overlay, else left
-        if x + w > sw: x = max(0, root.winfo_rootx() - w - 6)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        x = win.winfo_rootx() + win.winfo_width() + 6            # right of the hovered panel, else left of it
+        if x + w > sw: x = max(0, win.winfo_rootx() - w - 6)
         y = max(0, min(row.winfo_rooty() + row.winfo_height() // 2 - h // 2, sh - h))
         popup.geometry(f"+{x}+{y}")
         popup.deiconify(); popup.lift()
@@ -718,14 +729,59 @@ def run_overlay(a, fol, db, names, state, arena):
         show_card(row)
 
     def leave(row):
-        row.config(bg=BG)
+        try: row.config(bg=BG)
+        except tk.TclError: return
         if hover["row"] is row: hover["row"] = None
         hover["hide"] = root.after(80, hide_card)
 
-    # ---- window: header bar + one label per row
-    grab = {}
-    def start(e): grab["dx"], grab["dy"] = e.x_root - root.winfo_x(), e.y_root - root.winfo_y()
-    def move(e): root.geometry(f"+{e.x_root - grab['dx']}+{e.y_root - grab['dy']}")
+    class Panel:
+        """One borderless always-on-top window: a header bar (drag to move) and one label per row."""
+        def __init__(self, title, pos, paste=None):
+            self.win = w = tk.Toplevel(root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            try: w.attributes("-alpha", a.alpha)             # needs a compositor (xfwm4: Window Manager Tweaks)
+            except tk.TclError: pass
+            w.configure(bg=BG)
+            w.geometry(pos)
+            self.pool, self.shown, self.grab = [], 0, {}
+            bar = tk.Frame(w, bg=BG); bar.pack(fill="x")
+            lab = tk.Label(bar, text=title, fg=DIM, bg=BG, font=fnt); lab.pack(side="left", padx=4)
+            buttons = [("x", self.close)] + ([("paste", paste)] if paste else [])
+            for txt, cmd in buttons:
+                b = tk.Label(bar, text=txt, fg=DIM, bg=BG, font=fnt, cursor="hand2"); b.pack(side="right", padx=4)
+                b.bind("<Button-1>", lambda e, c=cmd: c())
+            tk.Frame(w, width=col_w, height=1, bg=BG).pack()    # spacer: both panels have the same width
+            self.box = tk.Frame(w, bg=BG); self.box.pack(fill="both")
+            for x in (bar, lab, self.box): self.drag(x)
+            panels.append(self)
+
+        def drag(self, widget):
+            widget.bind("<ButtonPress-1>", lambda e: self.grab.update(dx=e.x_root - self.win.winfo_x(), dy=e.y_root - self.win.winfo_y()))
+            widget.bind("<B1-Motion>", lambda e: self.win.geometry(f"+{e.x_root - self.grab['dx']}+{e.y_root - self.grab['dy']}"))
+
+        def close(self):
+            hide_card()
+            self.win.destroy(); panels.remove(self)
+            if not panels: root.destroy()
+
+        def make_row(self):
+            lab = tk.Label(self.box, text="", justify="left", anchor="w", fg=FG, bg=BG, font=fnt, padx=5, pady=0)
+            lab.cid = None
+            lab.bind("<Enter>", lambda e, r=lab: enter(r)); lab.bind("<Leave>", lambda e, r=lab: leave(r))
+            self.drag(lab)
+            return lab
+
+        def set_lines(self, lines):
+            while len(self.pool) < len(lines): self.pool.append(self.make_row())
+            for lab, (text, cid) in zip(self.pool, lines):
+                if lab.cget("text") != text: lab.config(text=text)
+                lab.cid = cid
+            if len(lines) != self.shown:
+                for i, lab in enumerate(self.pool):
+                    if i < len(lines): lab.pack(fill="x")
+                    else: lab.pack_forget()
+                self.shown = len(lines)
 
     def paste():
         try: text = root.clipboard_get()
@@ -738,49 +794,27 @@ def run_overlay(a, fol, db, names, state, arena):
         save_deck(text)
         refresh()
 
-    bar = tk.Frame(root, bg=BG); bar.pack(fill="x")
-    title = tk.Label(bar, text="hstrack", fg=DIM, bg=BG, font=fnt); title.pack(side="left", padx=4)
-    for txt, cmd in (("x", root.destroy), ("paste", paste)):
-        b = tk.Label(bar, text=txt, fg=DIM, bg=BG, font=fnt, cursor="hand2"); b.pack(side="right", padx=4)
-        b.bind("<Button-1>", lambda e, c=cmd: c())
-    box = tk.Frame(root, bg=BG); box.pack(fill="both")
-    for w in (bar, title, box):
-        w.bind("<ButtonPress-1>", start); w.bind("<B1-Motion>", move)
-
-    def make_row():
-        lab = tk.Label(box, text="", justify="left", anchor="w", fg=FG, bg=BG, font=fnt, padx=5, pady=0)
-        lab.cid = None
-        lab.bind("<Enter>", lambda e, r=lab: enter(r)); lab.bind("<Leave>", lambda e, r=lab: leave(r))
-        lab.bind("<ButtonPress-1>", start); lab.bind("<B1-Motion>", move)
-        return lab
-
-    def set_lines(lines):
-        while len(pool) < len(lines): pool.append(make_row())
-        for lab, (text, cid) in zip(pool, lines):
-            if lab.cget("text") != text: lab.config(text=text)
-            lab.cid = cid
-        if len(lines) != shown[0]:
-            for i, lab in enumerate(pool):
-                if i < len(lines): lab.pack(fill="x")
-                else: lab.pack_forget()
-            shown[0] = len(lines)
+    mine = Panel("hstrack", a.pos, paste)                       # your deck, on the right
+    theirs = None if a.no_opp else Panel("opponent", a.opp_pos)  # the opponent's cards, on the left
 
     def refresh():
         deck, src, learned = choose_deck(fol.g, state, arena, fol.path)
         s = summary(fol.g, names, db, deck, learned)
         if s["changed"]: save_learned(state["learned"])
-        lines = overlay_lines(s, deck, src, state["err"], a.opp)
-        if fol.msg: lines += [("", None)] + [(t, None) for t in textwrap.wrap(fol.msg.replace("\n", " "), 24)]
-        set_lines(lines)
+        if mine in panels:
+            lines = overlay_lines(s, deck, src, state["err"])
+            if fol.msg: lines += [("", None)] + [(t, None) for t in textwrap.wrap(fol.msg.replace("\n", " "), 24)]
+            mine.set_lines(lines)
+        if theirs is not None and theirs in panels: theirs.set_lines(opp_lines(s))
         if images:
-            for r in s["rows"]:
-                if r[3]: images.want(r[3])                     # fetch deck pictures ahead of hovering
+            for cid in [r[3] for r in s["rows"]] + [o[2] for o in s["opp"]]:
+                if cid: images.want(cid)                       # fetch pictures ahead of hovering
         row = hover["row"]
         if row is not None and row.cid != hover["cid"]: show_card(row)
 
     def tick():
         if fol.poll(): refresh()
-        root.lift()                        # stay above the game window
+        for p in panels: p.win.lift()                           # stay above the game window
         if hover["cid"]: popup.lift()
         root.after(500, tick)
 
@@ -796,10 +830,11 @@ def main():
     ap.add_argument("--log", help="read this Power.log instead of searching the prefix")
     ap.add_argument("--deck", help="deck file or deck code for non-arena games (default: the last deck you pasted)")
     ap.add_argument("-o", "--overlay", action="store_true", help="show the always-on-top overlay window")
-    ap.add_argument("--pos", default="+20+120", help="overlay position, e.g. +20+120 (drag the header to move)")
+    ap.add_argument("--pos", default="-20+120", help="your panel's position, -20+120 = 20px from the right edge (drag the header to move)")
+    ap.add_argument("--opp-pos", default="+20+120", help="opponent panel's position (default: left side)")
     ap.add_argument("--alpha", type=float, default=0.88, help="overlay opacity 0.2-1.0")
     ap.add_argument("--size", type=int, default=10, help="overlay font size")
-    ap.add_argument("--opp", action="store_true", help="also list opponent's played cards in the overlay")
+    ap.add_argument("--no-opp", action="store_true", help="don't show the opponent panel")
     ap.add_argument("--no-images", action="store_true", help="don't show card pictures on hover")
     ap.add_argument("--img-url", default=IMG_URL, help="card picture URL template with {id}")
     ap.add_argument("--once", action="store_true", help="terminal mode: parse once, print, exit")

@@ -2,7 +2,8 @@
 
 Tiny Hearthstone tracker for Linux. It follows Hearthstone's logs and shows the
 **cards remaining in your deck** (mana cost, count, draw chance) in a small
-always-on-top overlay. Python 3, standard library only; the tracker itself needs
+always-on-top panel on the right of the screen, and the **cards your opponent has
+played** in a second panel of the same width on the left. Python 3, standard library only; the tracker itself needs
 no Wine. The overlay needs Tk (Void: `sudo xbps-install -S python3-tkinter`).
 
 - **Arena / Underground Arena:** the deck is read automatically from `Arena.log`.
@@ -66,11 +67,21 @@ Herald card (or Heralded), `herald 6` shows how many times you have Heralded thi
 game. It counts the game's own Herald counter for your player, which matched the
 Herald effects in every game of the real logs I tested.
 
+### Opponent panel
+
+The left panel follows your opponent: hand and deck sizes, their hero's health
+(`hp 28/30`, plus armor and `herald N` once they use Herald, read the same way as
+yours) and every card they have played or revealed this game, sorted by mana cost.
+Their deck list is not in the log, so this is what has been seen, not what is left.
+Both panels are the same width (the height follows the content), drag either by its
+header, and the `x` in a header closes just that panel (the app exits when both are
+closed). `--no-opp` shows only your panel.
+
 ### Card pictures
 
-Hover a card in the list to see its picture in a second window beside the overlay
-(on the left if there is no room on the right). With `--opp` the opponent's played
-cards work the same way. Pictures come from HearthstoneJSON
+Hover a card in either panel to see its picture in a separate window beside it
+(on the side facing the middle of the screen, or the other side if there is no
+room). Pictures come from HearthstoneJSON
 (`art.hearthstonejson.com`), are downloaded in the background as soon as your deck
 is known, and are cached in `~/.cache/hstrack/img`, so hovering is instant and the
 first download is the only one. The picture window is cut to the card's shape, so
@@ -81,9 +92,10 @@ Card art is Blizzard's; this is for personal use. Disable with `--no-images`.
 
 ## Options
 
-`--pos +20+120` start position (drag the header to move), `--size 12` font size
-(default 10), `--alpha 0.9` opacity, `--opp` also list the cards the opponent
-played, `--no-images` no hover pictures, `--img-url` picture URL template with
+`--pos -20+120` your panel's position (default: 20px from the right edge, 120px
+from the top; `+20+120` would be the left edge), `--opp-pos +20+120` the opponent
+panel's position (default: left), `--size 12` font size (default 10), `--alpha 0.9`
+opacity, `--no-opp` no opponent panel, `--no-images` no hover pictures, `--img-url` picture URL template with
 `{id}`. Without `--overlay` you get a terminal view; `--once` parses once and
 exits; `--log /path/to/Power.log` reads a specific file.
 
